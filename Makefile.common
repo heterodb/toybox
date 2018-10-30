@@ -1,0 +1,9 @@
+PG_CONFIG := pg_config
+PSQL := $(shell dirname $(shell which $(PG_CONFIG)))/psql
+
+CUDA_PATH_LIST := /usr/local/cuda /usr/local/cuda-*
+CUDA_PATH := $(shell for x in $(CUDA_PATH_LIST);    \
+           do test -e "$$x/include/cuda.h" && echo $$x; done | head -1)
+IPATH := $(CUDA_PATH)/include
+LPATH := $(CUDA_PATH)/lib64
+NVCC  := $(CUDA_PATH)/bin/nvcc
