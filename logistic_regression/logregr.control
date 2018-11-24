@@ -1,0 +1,4 @@
+comment = 'Logistic regression with PL/CUDA'
+default_version = '1.0'
+module_pathname = '$libdir/logregr'
+relocatable = true

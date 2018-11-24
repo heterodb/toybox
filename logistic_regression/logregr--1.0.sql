@@ -17,8 +17,8 @@ logregr_update_Z(VectorTypeFloat *Z,
 				 cl_float  **Xp,
 				 VectorTypeFloat *W)
 {
-	cl_uint		nitems = Z->length;
-	cl_uint		width = W->length;
+	cl_uint		nitems = Z->height;
+	cl_uint		width = W->height;
 	cl_uint		i, j;
 
 	for (i = get_global_id(); i < nitems; i += get_global_size())
@@ -41,7 +41,7 @@ logregr_update_P(cl_double **Preg,	/* out */
 				 VectorTypeFloat *Z)
 {
 	cl_double  *P = Preg[0];
-	cl_uint		nitems = Z->length;
+	cl_uint		nitems = Z->height;
 	cl_uint		nitems_bs;
 	cl_uint		i, j, k;
 	size_t		loop, nloops;
@@ -87,8 +87,8 @@ logregr_update_Wd(VectorTypeFloat *Wd,	/* out */
 				  VectorTypeFloat *Z)
 {
 	cl_double  *P = Pinv[0];
-	cl_uint		width = Wd->length;
-	cl_uint		nitems = Z->length;
+	cl_uint		width = Wd->height;
+	cl_uint		nitems = Z->height;
 	cl_uint		nitems_bs;
 	size_t		loop, nloops;
 	__shared__ cl_double v[MAXTHREADS_PER_BLOCK];
@@ -345,13 +345,13 @@ retry:
 	Tp = (char *)kds_d + __kds_unpack(cmeta->va_offset);
 
 	/* set of simple array of independent data */
-	if (!VALIDATE_ARRAY_VECTOR(arg3, PG_INT2OID))
+	if (!VALIDATE_ARRAY_VECTOR_TYPE_STRICT(arg3, PG_INT2OID))
 		EEXIT("independent variables must be 'smallint[]'");
 	iattrs = (VectorTypeShort *)arg3;
-	rc = cudaMallocManaged(&Xp, sizeof(float *) * iattrs->length);
+	rc = cudaMallocManaged(&Xp, sizeof(float *) * iattrs->height);
 	if (rc != cudaSuccess)
 		CUEXIT(rc, "failed on cudaMallocManaged");
-	for (i=0; i < iattrs->length; i++)
+	for (i=0; i < iattrs->height; i++)
 	{
 		j = iattrs->values[i];
 		if (j <= 0 || j > kds_h->ncols)
@@ -369,9 +369,24 @@ retry:
 		EEXIT("threshold must be positive number");
 	/* run main logic */
 	retval = (varlena *)logregr_train(Tp, Xp,
-									  iattrs->length + 1,	/* width */
+									  iattrs->height + 1,	/* width */
 									  kds_h->nitems,		/* nitems */
 									  arg4, arg5);
 }
 #plcuda_end
-$$ LANGUAGE 'plcuda'
+$$ LANGUAGE 'plcuda' STRICT;
+
+CREATE OR REPLACE FUNCTION
+logregr_predict(real[],		  -- result of the training
+                real[],       -- independent variables
+                float = 0.5)  -- threshold of true/false
+RETURNS bool
+AS 'MODULE_PATHNAME','logregr_predict'
+LANGUAGE C STRICT;
+
+CREATE OR REPLACE FUNCTION
+logregr_predict_prob(real[],  -- result of the training
+                     real[])  -- independent variables
+RETURNS float
+AS 'MODULE_PATHNAME','logregr_predict_prob'
+LANGUAGE C STRICT;
