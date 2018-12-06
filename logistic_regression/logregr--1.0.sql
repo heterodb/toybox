@@ -45,7 +45,7 @@ logregr_update_P(cl_double **Preg,	/* out */
 	cl_uint		nitems_bs;
 	cl_uint		i, j, k;
 	size_t		loop, nloops;
-	__shared__ cl_double v[MAXTHREADS_PER_BLOCK];
+	__shared__ cl_float v[MAXTHREADS_PER_BLOCK];
 
 	/* block size must be 1024 */
 	assert(get_local_size() == MAXTHREADS_PER_BLOCK);
@@ -55,7 +55,7 @@ logregr_update_P(cl_double **Preg,	/* out */
 		 loop < nloops;
 		 loop += get_global_size())
 	{
-		cl_double	sum;
+		cl_float	sum;
 
 		k = loop % nitems_bs;
 		i = (loop / nitems_bs) % width;
@@ -91,7 +91,7 @@ logregr_update_Wd(VectorTypeFloat *Wd,	/* out */
 	cl_uint		nitems = Z->height;
 	cl_uint		nitems_bs;
 	size_t		loop, nloops;
-	__shared__ cl_double v[MAXTHREADS_PER_BLOCK];
+	__shared__ cl_float v[MAXTHREADS_PER_BLOCK];
 
 	assert(get_local_size() == MAXTHREADS_PER_BLOCK);
 	nitems_bs = TYPEALIGN(get_global_size(), nitems);
@@ -101,7 +101,7 @@ logregr_update_Wd(VectorTypeFloat *Wd,	/* out */
 		 loop += get_global_size())
 	{
 		cl_uint		i, j, k;
-		cl_float	sum, val = 0.0;
+		cl_double	sum, val = 0.0;
 
 		i = loop % nitems_bs;
 		j = loop / nitems_bs;
@@ -238,7 +238,7 @@ logregr_train(cl_char   *Tp,		/* dependent data */
 	logregr_optimal_gridsz();
 	/* assign random initial value of W */
 	for (i=0; i < width; i++)
-		W->values[i] = 1.0;
+		W->values[i] = (i == 0 ? 1.0 : 0.0);
 	/* init cuBlas library */
 	status = cublasCreate(&handle);
 	if (status != CUBLAS_STATUS_SUCCESS)
@@ -251,11 +251,39 @@ logregr_train(cl_char   *Tp,		/* dependent data */
 		memset(Pinv[0], 0, sizeof(cl_double) * width * width);
 		/* compute Z vector */
 		logregr_update_Z<<<gridSz_Z, blockSz>>>(Z, Xp, W);
-		rc = cudaStreamSynchronize(NULL);
-        if (rc != cudaSuccess)
-            CUEXIT(rc, "failed on cudaStreamSynchronize 1");
+#if 0
+		{
+			rc = cudaStreamSynchronize(NULL);
+			if (rc != cudaSuccess)
+				CUEXIT(rc, "failed on cudaStreamSynchronize 1");
+
+			for (i=0; i < width; i++)
+			{
+				fprintf(stderr, "%s%f",
+						i==0 ? "Z: " : "  ", Z->values[i]);
+			}
+			fputc('\n', stderr);
+		}
+#endif
 		/* compute P matrix */
 		logregr_update_P<<<gridSz_P, blockSz>>>(Preg, Xp, width, Z);
+#if 0
+		{
+			rc = cudaStreamSynchronize(NULL);
+			if (rc != cudaSuccess)
+				CUEXIT(rc, "failed on cudaStreamSynchronize 1");
+
+			cl_double *pr = Preg[0];
+
+			fprintf(stderr, "Preg");
+			for (i=0; i < width * width; i++)
+			{
+				fprintf(stderr, "%s%f",
+						i % width == 0 ? "\n" : "  ", pr[i]);
+			}
+			fputc('\n', stderr);
+		}
+#endif
 		/* compute P-inverse */
 		status = cublasDgetrfBatched(handle,
 									 width,
@@ -277,6 +305,23 @@ logregr_train(cl_char   *Tp,		/* dependent data */
 									 1);
 		if (status != CUBLAS_STATUS_SUCCESS)
 			EEXIT("failed on cublasSgetriBatched: %d", (int)status);
+#if 0
+		{
+			rc = cudaStreamSynchronize(NULL);
+			if (rc != cudaSuccess)
+				CUEXIT(rc, "failed on cudaStreamSynchronize 1");
+
+			cl_double *pi = Pinv[0];
+
+			fprintf(stderr, "Pinv");
+			for (i=0; i < width * width; i++)
+			{
+				fprintf(stderr, "%s%f",
+						i % width == 0 ? "\n" : "  ", pi[i]);
+			}
+			fputc('\n', stderr);
+		}
+#endif
 		/* compute Wd vector */
 		logregr_update_Wd<<<gridSz_Wd, blockSz>>>(Wd, Xp, Tp, Pinv, Z);
 		/* compute delta */
@@ -368,10 +413,10 @@ retry:
 	if (arg5 <= 0)
 		EEXIT("threshold must be positive number");
 	/* run main logic */
-	retval = (varlena *)logregr_train(Tp, Xp,
-									  iattrs->height + 1,	/* width */
-									  kds_h->nitems,		/* nitems */
-									  arg4, arg5);
+    return (varlena *)logregr_train(Tp, Xp,
+									iattrs->height + 1,	/* width */
+									kds_h->nitems,		/* nitems */
+									arg4, arg5);
 }
 #plcuda_end
 $$ LANGUAGE 'plcuda' STRICT;
