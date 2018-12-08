@@ -430,8 +430,8 @@ AS 'MODULE_PATHNAME','logregr_predict'
 LANGUAGE C STRICT;
 
 CREATE OR REPLACE FUNCTION
-logregr_predict(real[],		  -- result of the training
-                real[],       -- independent variables
+logregr_predict(float[],	  -- result of the training
+                float[],      -- independent variables
                 float = 0.5)  -- threshold of true/false
 RETURNS bool
 AS 'MODULE_PATHNAME','logregr_predict_fp64'
@@ -445,8 +445,8 @@ AS 'MODULE_PATHNAME','logregr_predict_prob'
 LANGUAGE C STRICT;
 
 CREATE OR REPLACE FUNCTION
-logregr_predict_prob(real[],  -- result of the training
-                     real[])  -- independent variables
+logregr_predict_prob(float[],  -- result of the training
+                     float[])  -- independent variables
 RETURNS float
 AS 'MODULE_PATHNAME','logregr_predict_prob_fp64'
 LANGUAGE C STRICT;
