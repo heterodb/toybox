@@ -63,9 +63,9 @@ logregr_update_P(cl_double **Preg,	/* out */
 		assert(i < width && j < width);
 		if (k < nitems)
 		{
-			cl_double	z = Z->values[k];
-			cl_double	x1 = (i == 0 ? 1.0 : Xp[i-1][k]);
-			cl_double	x2 = (j == 0 ? 1.0 : Xp[j-1][k]);
+			cl_float	z = Z->values[k];
+			cl_float	x1 = (i == 0 ? 1.0 : Xp[i-1][k]);
+			cl_float	x2 = (j == 0 ? 1.0 : Xp[j-1][k]);
 
 			v[get_local_id()] = x1 * z * (1.0 - z) * x2;
 		}
@@ -430,8 +430,23 @@ AS 'MODULE_PATHNAME','logregr_predict'
 LANGUAGE C STRICT;
 
 CREATE OR REPLACE FUNCTION
+logregr_predict(real[],		  -- result of the training
+                real[],       -- independent variables
+                float = 0.5)  -- threshold of true/false
+RETURNS bool
+AS 'MODULE_PATHNAME','logregr_predict_fp64'
+LANGUAGE C STRICT;
+
+CREATE OR REPLACE FUNCTION
 logregr_predict_prob(real[],  -- result of the training
                      real[])  -- independent variables
 RETURNS float
 AS 'MODULE_PATHNAME','logregr_predict_prob'
+LANGUAGE C STRICT;
+
+CREATE OR REPLACE FUNCTION
+logregr_predict_prob(real[],  -- result of the training
+                     real[])  -- independent variables
+RETURNS float
+AS 'MODULE_PATHNAME','logregr_predict_prob_fp64'
 LANGUAGE C STRICT;
