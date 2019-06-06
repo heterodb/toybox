@@ -3,8 +3,6 @@ gpu_dot_product(real[], real[])
 RETURNS float
 AS $$
 #plcuda_decl
-#include "cuda_matrix.h"
-
 KERNEL_FUNCTION_MAXTHREADS(void)
 gpu_dot_product(double *p_dot,
 				VectorTypeFloat *X,
