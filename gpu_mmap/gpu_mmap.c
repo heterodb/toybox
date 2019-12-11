@@ -304,7 +304,10 @@ static int export_gpu_memory(void)
 	rc = cuMemCreate(&mem_handle, buffer_size, &prop, 0);
 	if (rc != CUDA_SUCCESS)
 		Elog("failed on cuMemCreate: %s", errorName(rc));
-
+#if 0
+	/* confirm physical memory consumption */
+	system("nvidia-smi");
+#endif
 	rc = cuMemAddressReserve(&cuda_buffer, buffer_size, 0, 0UL, 0);
 	if (rc != CUDA_SUCCESS)
 		Elog("failed on cuMemAddressReserve: %s", errorName(rc));
