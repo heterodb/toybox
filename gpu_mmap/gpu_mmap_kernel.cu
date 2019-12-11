@@ -19,8 +19,6 @@ void gpu_mmap_init(char *buffer, size_t buffer_sz)
 		seed = (next >> 16) & 0x7fffffffU;
 		values[i] = 100.0 * ((double)seed / (double)UINT_MAX);
 	}
-	if (get_global_id() == 0)
-		printf("buffer = %lx buffer_sz = %lu\n", buffer, buffer_sz);
 }
 
 extern "C" __global__ __launch_bounds__(1024)

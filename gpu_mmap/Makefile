@@ -4,7 +4,7 @@ CUDA_LIBS = $(CUDA_PATH)/lib64
 CUDA_BIN  = $(CUDA_PATH)/bin
 NVCC = $(CUDA_BIN)/nvcc
 
-CFLAGS = -I$(CUDA_INCLUDE) -L$(CUDA_LIBS)
+CFLAGS = -Wall -I$(CUDA_INCLUDE) -L$(CUDA_LIBS)
 
 all: gpu_mmap
 
@@ -18,7 +18,7 @@ gpu_mmap_kernel.h: gpu_mmap_kernel.ptx
 	   echo ';') > $@
 
 gpu_mmap: gpu_mmap.c gpu_mmap_kernel.h
-	$(CC) $(CFLAGS) -o $@ $< -lcuda
+	$(CC) $(CFLAGS) -o $@ $< -lcuda -lpthread
 
 clean:
 	rm -f gpu_mmap gpu_mmap_kernel.h gpu_mmap_kernel.ptx

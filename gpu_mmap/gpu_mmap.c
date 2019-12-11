@@ -1,13 +1,15 @@
 #include <assert.h>
 #include <errno.h>
 #include <libgen.h>
+#include <pthread.h>
+#include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/types.h>
 #include <sys/socket.h>
 #include <sys/un.h>
-#include <signal.h>
+#include <sys/wait.h>
 #include <unistd.h>
 #include <cuda.h>
 #include "gpu_mmap_kernel.h"
@@ -38,7 +40,6 @@ static CUcontext	cuda_context = NULL;
 static CUmodule		cuda_module = NULL;
 static CUdeviceptr	cuda_buffer = 0UL;
 static CUdeviceptr	cuda_result = 0UL;
-
 
 static double launch_kernel(CUmemGenericAllocationHandle mem_handle,
 							const char *kfunc_name)
@@ -89,48 +90,75 @@ static double launch_kernel(CUmemGenericAllocationHandle mem_handle,
 
 	rc = cuMemcpyDtoH(&result, cuda_result, sizeof(double));
 	if (rc != CUDA_SUCCESS)
-		Elog("failed on cuMemcpyDtoH(%lx): %s", cuda_result, errorName(rc));
+		Elog("failed on cuMemcpyDtoH: %s", errorName(rc));
 
 	return result;
 }
 
-static void
-send_ipc_handle(int sockfd, int ipc_handle)
+typedef struct
 {
-	int				client;
-	struct msghdr	msg;
-	struct iovec	iov;
-	union {
-		struct cmsghdr cm;
-		char control[CMSG_SPACE(sizeof(int))];
-	} ctrl_un;
-	struct cmsghdr *cmp;
+	int		cuda_dindex;
+	size_t	buffer_size;
+} ipc_message_t;
 
-	client = accept(sockfd, NULL, NULL);
-	if (client < 0)
-		Elog("failed on accept: %m");
+static inline void
+__server_loop(int sockfd, int ipc_handle)
+{
+	for (;;)
+	{
+		int				client;
+		struct msghdr	msg;
+		struct iovec	iov;
+		char			cmsg_buf[CMSG_SPACE(sizeof(int))];
+		struct cmsghdr *cmsg;
+		ipc_message_t	payload;
 
-	/* send a file descriptor using SCM_RIGHTS */
-	memset(&msg, 0, sizeof(msg));
-	msg.msg_control = ctrl_un.control;
-	msg.msg_controllen = sizeof(ctrl_un.control);
+		client = accept(sockfd, NULL, NULL);
+		if (client < 0)
+			Elog("failed on accept: %m");
 
-	cmp = CMSG_FIRSTHDR(&msg);
-	cmp->cmsg_len = CMSG_LEN(sizeof(int));
-	cmp->cmsg_level = SOL_SOCKET;
-	cmp->cmsg_type = SCM_RIGHTS;
+		/* send a file descriptor using SCM_RIGHTS */
+		memset(&msg, 0, sizeof(msg));
+		msg.msg_control = cmsg_buf;
+		msg.msg_controllen = sizeof(cmsg_buf);
 
-	memcpy(CMSG_DATA(cmp), &ipc_handle, sizeof(ipc_handle));
+		cmsg = CMSG_FIRSTHDR(&msg);
+		cmsg->cmsg_len = CMSG_LEN(sizeof(int));
+		cmsg->cmsg_level = SOL_SOCKET;
+		cmsg->cmsg_type = SCM_RIGHTS;
 
-	iov.iov_base = (void *)"";
-	iov.iov_len = 1;
-	msg.msg_iov = &iov;
-	msg.msg_iovlen = 1;
+		memcpy(CMSG_DATA(cmsg), &ipc_handle, sizeof(ipc_handle));
 
-	if (sendmsg(client, &msg, 0) < 0)
-		Elog("failed on sendmsg(2): %m");
+		memset(&payload, 0, sizeof(payload));
+		payload.cuda_dindex = cuda_dindex;
+		payload.buffer_size = buffer_size;
 
-	close(client);
+		iov.iov_base = &payload;
+		iov.iov_len = sizeof(payload);
+		msg.msg_iov = &iov;
+		msg.msg_iovlen = 1;
+
+		if (sendmsg(client, &msg, 0) < 0)
+			Elog("failed on sendmsg(2): %m");
+
+		close(client);
+	}
+}
+
+typedef struct
+{
+	int		sockfd;
+	int		ipc_handle;
+} serv_args_t;
+
+static void *
+server_loop(void *pthread_args)
+{
+	serv_args_t	   *serv_args = (serv_args_t *)pthread_args;
+
+	__server_loop(serv_args->sockfd, serv_args->ipc_handle);
+
+	return NULL;
 }
 
 static int
@@ -139,13 +167,9 @@ recv_ipc_handle(struct sockaddr_un *addr)
 	int				client;
 	struct msghdr	msg;
     struct iovec	iov;
-    struct cmsghdr	cm;
-	union {
-		struct cmsghdr cm;
-		char control[CMSG_SPACE(sizeof(int))];
-	} ctrl_un;
-	struct cmsghdr *cmp;
-	char			dummy[1];
+	struct cmsghdr *cmsg;
+	char			cmsg_buf[CMSG_SPACE(sizeof(int))];
+	ipc_message_t	payload;
 	int				ipc_handle = -1;
 
 	/* connect to the server socket */
@@ -157,11 +181,12 @@ recv_ipc_handle(struct sockaddr_un *addr)
 		Elog("failed on connect(2): %m");
 
 	/* recv a file descriptor using SCM_RIGHTS */
-	msg.msg_control = ctrl_un.control;
-	msg.msg_controllen = sizeof(ctrl_un.control);
+	memset(&msg, 0, sizeof(msg));
+	msg.msg_control = cmsg_buf;
+	msg.msg_controllen = sizeof(cmsg_buf);
 
-	iov.iov_base = (void *)dummy;
-	iov.iov_len = sizeof(dummy);
+	iov.iov_base = &payload;
+	iov.iov_len = sizeof(payload);
 
 	msg.msg_iov = &iov;
 	msg.msg_iovlen = 1;
@@ -169,17 +194,20 @@ recv_ipc_handle(struct sockaddr_un *addr)
 	if (recvmsg(client, &msg, 0) <= 0)
 		Elog("failed on recvmsg(2): %m");
 
-	cmp = CMSG_FIRSTHDR(&msg);
-	if (!cmp)
+	cmsg = CMSG_FIRSTHDR(&msg);
+	if (!cmsg)
 		Elog("message has no control header");
-	if (cmp->cmsg_len == CMSG_LEN(sizeof(int)) &&
-		cmp->cmsg_level == SOL_SOCKET &&
-		cmp->cmsg_type == SCM_RIGHTS)
+	if (cmsg->cmsg_len == CMSG_LEN(sizeof(int)) &&
+		cmsg->cmsg_level == SOL_SOCKET &&
+		cmsg->cmsg_type == SCM_RIGHTS)
 	{
-		memcpy(&ipc_handle, CMSG_DATA(cmp), sizeof(int));
+		memcpy(&ipc_handle, CMSG_DATA(cmsg), sizeof(int));
 	}
 	else
 		Elog("unexpected control header");
+
+	cuda_dindex = payload.cuda_dindex;
+	buffer_size = payload.buffer_size;
 
 	return ipc_handle;
 }
@@ -187,7 +215,6 @@ recv_ipc_handle(struct sockaddr_un *addr)
 static int child_main(struct sockaddr_un *addr)
 {
 	int			ipc_handle = recv_ipc_handle(addr);
-	ssize_t		sz;
 	CUresult	rc;
 	CUmemGenericAllocationHandle mem_handle;
 	CUmemAccessDesc access;
@@ -238,7 +265,7 @@ static int child_main(struct sockaddr_un *addr)
 	return 0;
 }
 
-static int parent_main(void)
+static int export_gpu_memory(void)
 {
 	CUresult	rc;
 	size_t		granularity;
@@ -247,8 +274,6 @@ static int parent_main(void)
 	CUmemAccessDesc access;
 	int			ipc_handle;	/* POSIX file handle */
 	double		sum;
-	int			i, sz;
-	char		temp[100];
 
 	rc = cuInit(0);
 	if (rc != CUDA_SUCCESS)
@@ -335,14 +360,11 @@ static void usage(char *argv0, int exitcode)
 
 int main(int argc, char *argv[])
 {
-	pid_t	   *children;
-	int		   *fdesc;
 	int			sockfd;
-	int			i, c, sz;
-	int			ipc_handle;
+	int			i, c;
 	struct sockaddr_un addr;
-	char		temp[100];
-	char		sock_path[100];
+	pthread_t	thread;
+	serv_args_t	serv_args;
 
 	while ((c = getopt(argc, argv, "d:n:l:hv")) >= 0)
 	{
@@ -394,7 +416,6 @@ int main(int argc, char *argv[])
 	/*
 	 * spawn child processes
 	 */
-	children = alloca(sizeof(pid_t) * num_children);
 	for (i=0; i < num_children; i++)
 	{
 		pid_t	child = fork();
@@ -404,33 +425,33 @@ int main(int argc, char *argv[])
 			close(sockfd);
 			return child_main(&addr);
 		}
-		else if (child > 0)
-			children[i] = child;
-		else
+		else if (child < 0)
 		{
 			fprintf(stderr, "failed on fork(2): %m\n");
-			while (--i >= 0)
-				kill(children[i], SIGTERM);
+			killpg(0, SIGTERM);
 			return 1;
 		}
 	}
-	ipc_handle = parent_main();
-	/*
-	 * send sharable IPC handle for each child process
-	 */
-	for (i=0; i < num_children; i++)
-		send_ipc_handle(sockfd, ipc_handle);
+	serv_args.sockfd = sockfd;
+	serv_args.ipc_handle = export_gpu_memory();
+	if (pthread_create(&thread, NULL, server_loop, &serv_args) != 0)
+	{
+		fprintf(stderr, "failed on pthread_create(3): %m\n");
+		killpg(0, SIGTERM);
+		return 1;
+	}
 
 	/* wait for exit of child processes */
-	for (i=0; i < num_children; i++)
+	while (1)
 	{
-		pid_t	child = children[i];
 		int		status;
 
-		if (waitpid(child, &status, 1) != 0)
-			Elog("failed on waitpid(%u): %m", (unsigned int)child);
-		if (!WIFEXITED(status) || WEXITSTATUS(status) != 0)
-			printf("child process (pid: %u) was not exited normaly\n", child);
+		if (wait(&status) != 0)
+		{
+			if (errno == EEXIST)
+				break;
+			Elog("failed on wait(2): %m");
+		}
 	}
 	/* cleanup */
 	unlink(addr.sun_path);
