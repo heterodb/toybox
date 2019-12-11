@@ -232,19 +232,19 @@ static int child_main(struct sockaddr_un *addr)
 	if (rc != CUDA_SUCCESS)
 		Elog("failed on cuCtxCreate: %s", errorName(rc));
 
-	/* reserve address space */
-	rc = cuMemAddressReserve(&cuda_buffer,
-							 buffer_size,
-							 0, 0UL, 0);
-	if (rc != CUDA_SUCCESS)
-		Elog("failed on cuMemAddressReserve: %s", errorName(rc));
-
 	/* import shared memory handle */
 	rc = cuMemImportFromShareableHandle(&mem_handle,
 										(void *)(uintptr_t)ipc_handle,
 									CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR);
 	if (rc != CUDA_SUCCESS)
 		Elog("failed on cuMemImportFromShareableHandle: %s", errorName(rc));
+
+	/* reserve virtual address space */
+	rc = cuMemAddressReserve(&cuda_buffer,
+							 buffer_size,
+							 0, 0UL, 0);
+	if (rc != CUDA_SUCCESS)
+		Elog("failed on cuMemAddressReserve: %s", errorName(rc));
 
 	/* map device memory */
 	rc = cuMemMap(cuda_buffer, buffer_size, 0, mem_handle, 0);
@@ -323,18 +323,6 @@ static int export_gpu_memory(void)
 	launch_kernel(mem_handle, "gpu_mmap_init");
 	sum = launch_kernel(mem_handle, "gpu_mmap_kernel");
 	printf("total sum [master]: %f\n", sum);
-
-#if 0
-	rc = cuMemUnmap(cuda_buffer, buffer_size);
-	if (rc != CUDA_SUCCESS)
-		Elog("failed on cuMemUnmap: %s", errorName(rc));
-	rc = cuMemAddressFree(cuda_buffer, buffer_size);
-	if (rc != CUDA_SUCCESS)
-		Elog("failed on cuMemAddressFree: %s", errorName(rc));
-	rc = cuMemRelease(mem_handle);
-	if (rc != CUDA_SUCCESS)
-		Elog("failed on cuMemRelease: %s", errorName(rc));
-#endif
 
 	/* export the above allocation to sharable handle */
 	rc = cuMemExportToShareableHandle(&ipc_handle, mem_handle,
