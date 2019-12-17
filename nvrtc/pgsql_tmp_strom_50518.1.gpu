@@ -1,0 +1,364 @@
+#include <cuda_device_runtime_api.h>
+#define KERN_CONTEXT_VARLENA_BUFSZ 200
+#include "cuda_common.h"
+
+/* ================================================
+ * session information for device text library
+ * ================================================ */
+DEVICE_FUNCTION(cl_int)
+pg_database_encoding_max_length(void)
+{
+  return 4;
+}
+
+DEVICE_FUNCTION(cl_int)
+pg_wchar_mblen(const char *str)
+{
+  cl_uchar c = *((const cl_uchar *)str);
+  if ((c & 0x80) == 0)
+    return 1;
+  else if ((c & 0xe0) == 0xc0)
+    return 2;
+  else if ((c & 0xf0) == 0xe0)
+    return 3;
+  else if ((c & 0xf8) == 0xf0)
+    return 4;
+#ifdef NOT_USED
+  else if ((c & 0xfc) == 0xf8)
+    return 5;
+  else if ((c & 0xfe) == 0xfc)
+    return 6;
+#endif
+  return 1;
+}
+
+#define GPUJOIN_MAX_DEPTH 1
+
+#include "cuda_gpujoin.h"
+
+DEVICE_FUNCTION(cl_bool)
+gpujoin_quals_eval(kern_context *kcxt,
+                   kern_data_store *kds,
+                   ItemPointerData *t_self,
+                   HeapTupleHeaderData *htup)
+{
+  void *addr __attribute__((unused));
+
+  return true;
+}
+
+DEVICE_FUNCTION(cl_bool)
+gpujoin_quals_eval_arrow(kern_context *kcxt,
+                         kern_data_store *kds,
+                         cl_uint row_index)
+{
+  void *addr __attribute__((unused));
+
+  return true;
+}
+
+DEVICE_FUNCTION(cl_bool)
+gpujoin_join_quals_depth1(kern_context *kcxt,
+                          kern_data_store *kds,
+                          kern_multirels *kmrels,
+                          cl_uint *o_buffer,
+                          HeapTupleHeaderData *i_htup,
+                          cl_bool *joinquals_matched)
+{
+  HeapTupleHeaderData *htup  __attribute__((unused));
+  kern_data_store *kds_in    __attribute__((unused));
+  void *datum                __attribute__((unused));
+  cl_uint offset             __attribute__((unused));
+  pg_int4_t KVAR_1;
+  pg_int4_t KVAR_9;
+
+  /* variable load in depth-0 (outer KDS) */
+  offset = (!o_buffer ? 0 : o_buffer[0]);
+  if (!kds)
+  {
+    pg_datum_ref(kcxt,KVAR_1,NULL); //pg_int4_t
+  }
+  else if (__ldg(&kds->format) != KDS_FORMAT_ARROW)
+  {
+    if (offset == 0)
+      htup = NULL;
+    else if (__ldg(&kds->format) == KDS_FORMAT_ROW)
+      htup = KDS_ROW_REF_HTUP(kds,offset,NULL,NULL);
+    else if (__ldg(&kds->format) == KDS_FORMAT_BLOCK)
+      htup = KDS_BLOCK_REF_HTUP(kds,offset,NULL,NULL);
+    else
+      htup = NULL; /* bug */
+    datum = GPUJOIN_REF_DATUM(kds->colmeta,htup,1);
+    pg_datum_ref(kcxt,KVAR_1,datum); //pg_int4_t
+  }
+  else
+  {
+    if (offset > 0)
+      pg_datum_ref_arrow(kcxt,KVAR_1,kds,1,offset-1);
+    else
+      pg_datum_ref(kcxt,KVAR_1,NULL);
+  }
+  /* variable load in depth-1 (inner KDS) */
+  {
+    kds_in = KERN_MULTIRELS_INNER_KDS(kmrels, 1);
+    assert(__ldg(&kds_in->format) == KDS_FORMAT_HASH);
+    htup = i_htup;
+    datum = GPUJOIN_REF_DATUM(kds_in->colmeta,htup,2);
+    pg_datum_ref(kcxt,KVAR_9,datum); //pg_int4_t
+  }
+
+  if (i_htup && o_buffer && !EVAL(pgfn_int4eq(kcxt, KVAR_1, KVAR_9)))
+  {
+    if (joinquals_matched)
+      *joinquals_matched = false;
+    return false;
+  }
+  if (joinquals_matched)
+    *joinquals_matched = true;
+  return true;
+}
+
+DEVICE_FUNCTION(cl_bool)
+gpujoin_join_quals(kern_context *kcxt,
+                   kern_data_store *kds,
+                   kern_multirels *kmrels,
+                   int depth,
+                   cl_uint *o_buffer,
+                   HeapTupleHeaderData *i_htup,
+                   cl_bool *needs_outer_row)
+{
+  switch (depth)
+  {
+  case 1:
+    return gpujoin_join_quals_depth1(kcxt, kds, kmrels,
+                                     o_buffer, i_htup,
+                                     needs_outer_row);
+  default:
+    STROM_EREPORT(kcxt, ERRCODE_STROM_WRONG_CODE_GENERATION,
+                  "GpuJoin: wrong code generation");
+    break;
+  }
+  return false;
+}
+
+STATIC_FUNCTION(cl_uint)
+gpujoin_hash_value_depth1(kern_context *kcxt,
+                          kern_data_store *kds,
+                          kern_multirels *kmrels,
+                          cl_uint *o_buffer,
+                          cl_bool *p_is_null_keys)
+{
+  cl_uint hash = 0xffffffffU;
+  cl_bool is_null_keys = true;
+  union {
+    pg_int4_t int4_v;
+  } temp;
+  HeapTupleHeaderData *htup  __attribute__((unused));
+  kern_data_store *kds_in    __attribute__((unused));
+  void *datum                __attribute__((unused));
+  cl_uint offset             __attribute__((unused));
+  pg_int4_t KVAR_1;
+
+  /* variable load in depth-0 (outer KDS) */
+  offset = (!o_buffer ? 0 : o_buffer[0]);
+  if (!kds)
+  {
+    pg_datum_ref(kcxt,KVAR_1,NULL); //pg_int4_t
+  }
+  else if (__ldg(&kds->format) != KDS_FORMAT_ARROW)
+  {
+    if (offset == 0)
+      htup = NULL;
+    else if (__ldg(&kds->format) == KDS_FORMAT_ROW)
+      htup = KDS_ROW_REF_HTUP(kds,offset,NULL,NULL);
+    else if (__ldg(&kds->format) == KDS_FORMAT_BLOCK)
+      htup = KDS_BLOCK_REF_HTUP(kds,offset,NULL,NULL);
+    else
+      htup = NULL; /* bug */
+    datum = GPUJOIN_REF_DATUM(kds->colmeta,htup,1);
+    pg_datum_ref(kcxt,KVAR_1,datum); //pg_int4_t
+  }
+  else
+  {
+    if (offset > 0)
+      pg_datum_ref_arrow(kcxt,KVAR_1,kds,1,offset-1);
+    else
+      pg_datum_ref(kcxt,KVAR_1,NULL);
+  }
+
+  temp.int4_v = KVAR_1;
+  if (!temp.int4_v.isnull)
+    is_null_keys = false;
+  hash ^= pg_comp_hash(kcxt, temp.int4_v);
+  *p_is_null_keys = is_null_keys;
+  hash ^= 0xffffffff;
+  return hash;
+}
+
+DEVICE_FUNCTION(cl_uint)
+gpujoin_hash_value(kern_context *kcxt,
+                   kern_data_store *kds,
+                   kern_multirels *kmrels,
+                   cl_int depth,
+                   cl_uint *o_buffer,
+                   cl_bool *is_null_keys)
+{
+  switch (depth)
+  {
+  case 1:
+    return gpujoin_hash_value_depth1(kcxt,kds,kmrels,
+                                      o_buffer,is_null_keys);
+  default:
+    STROM_EREPORT(kcxt, ERRCODE_STROM_WRONG_CODE_GENERATION,
+                  "GpuJoin: wrong code generation");
+    break;
+  }
+  return (cl_uint)(-1);
+}
+
+DEVICE_FUNCTION(cl_uint)
+gpujoin_projection(kern_context *kcxt,
+                   kern_data_store *kds_src,
+                   kern_multirels *kmrels,
+                   cl_uint *r_buffer,
+                   kern_data_store *kds_dst,
+                   cl_char *tup_dclass,
+                   Datum   *tup_values,
+                   cl_uint *tup_extras)
+{
+  HeapTupleHeaderData *htup    __attribute__((unused));
+  kern_data_store *kds_in      __attribute__((unused));
+  ItemPointerData  t_self      __attribute__((unused));
+  cl_uint          offset      __attribute__((unused));
+  cl_uint          sz          __attribute__((unused));
+  cl_uint          extra_sum = 0;
+  void            *addr        __attribute__((unused)) = NULL;
+  union {
+    pg_int4_t int4_v;
+    pg_text_t text_v;
+    pg_float8_t float8_v;
+    pg_bpchar_t bpchar_v;
+  } temp;
+
+  if (tup_extras)
+    memset(tup_extras, 0, sizeof(cl_uint) * kds_dst->ncols);
+  /* ------ extract outer relation ------ */
+  if (!kds_src)
+  {
+    tup_dclass[1] = DATUM_CLASS__NULL;
+    tup_dclass[0] = DATUM_CLASS__NULL;
+    tup_dclass[2] = DATUM_CLASS__NULL;
+    tup_dclass[3] = DATUM_CLASS__NULL;
+    tup_dclass[4] = DATUM_CLASS__NULL;
+    tup_dclass[5] = DATUM_CLASS__NULL;
+  }
+  else if (kds_src->format == KDS_FORMAT_ROW ||
+           kds_src->format == KDS_FORMAT_BLOCK)
+  {
+    offset = r_buffer[0];
+    if (offset == 0)
+      htup = NULL;
+    else if (kds_src->format == KDS_FORMAT_ROW)
+      htup = KDS_ROW_REF_HTUP(kds_src,offset,&t_self,NULL);
+    else
+      htup = KDS_BLOCK_REF_HTUP(kds_src,offset,&t_self,NULL);
+    EXTRACT_HEAP_TUPLE_BEGIN(addr, kds_src, htup);
+    EXTRACT_HEAP_READ_32BIT(addr,tup_dclass[1],tup_values[1]);
+    EXTRACT_HEAP_TUPLE_NEXT(addr);
+    EXTRACT_HEAP_READ_32BIT(addr,tup_dclass[0],tup_values[0]);
+    EXTRACT_HEAP_TUPLE_NEXT(addr);
+    EXTRACT_HEAP_READ_POINTER(addr,tup_dclass[2],tup_values[2]);
+    EXTRACT_HEAP_TUPLE_NEXT(addr);
+    EXTRACT_HEAP_READ_64BIT(addr,tup_dclass[3],tup_values[3]);
+    EXTRACT_HEAP_TUPLE_NEXT(addr);
+    EXTRACT_HEAP_READ_64BIT(addr,tup_dclass[4],tup_values[4]);
+    EXTRACT_HEAP_TUPLE_NEXT(addr);
+    EXTRACT_HEAP_READ_POINTER(addr,tup_dclass[5],tup_values[5]);
+    EXTRACT_HEAP_TUPLE_END();
+  }
+  else
+  {
+    offset = r_buffer[0];
+    if (offset > 0)
+      pg_datum_ref_arrow(kcxt,temp.int4_v,kds_src,0,offset-1);
+    else
+      pg_datum_ref(kcxt,temp.int4_v,NULL);
+    sz = pg_datum_store(kcxt, temp.int4_v,
+                        tup_dclass[1],
+                        tup_values[1]);
+    if (tup_extras)
+      tup_extras[1] = sz;
+    extra_sum += MAXALIGN(sz);
+    if (offset > 0)
+      pg_datum_ref_arrow(kcxt,temp.int4_v,kds_src,1,offset-1);
+    else
+      pg_datum_ref(kcxt,temp.int4_v,NULL);
+    sz = pg_datum_store(kcxt, temp.int4_v,
+                        tup_dclass[0],
+                        tup_values[0]);
+    if (tup_extras)
+      tup_extras[0] = sz;
+    extra_sum += MAXALIGN(sz);
+    if (offset > 0)
+      pg_datum_ref_arrow(kcxt,temp.text_v,kds_src,2,offset-1);
+    else
+      pg_datum_ref(kcxt,temp.text_v,NULL);
+    sz = pg_datum_store(kcxt, temp.text_v,
+                        tup_dclass[2],
+                        tup_values[2]);
+    if (tup_extras)
+      tup_extras[2] = sz;
+    extra_sum += MAXALIGN(sz);
+    if (offset > 0)
+      pg_datum_ref_arrow(kcxt,temp.float8_v,kds_src,3,offset-1);
+    else
+      pg_datum_ref(kcxt,temp.float8_v,NULL);
+    sz = pg_datum_store(kcxt, temp.float8_v,
+                        tup_dclass[3],
+                        tup_values[3]);
+    if (tup_extras)
+      tup_extras[3] = sz;
+    extra_sum += MAXALIGN(sz);
+    if (offset > 0)
+      pg_datum_ref_arrow(kcxt,temp.float8_v,kds_src,4,offset-1);
+    else
+      pg_datum_ref(kcxt,temp.float8_v,NULL);
+    sz = pg_datum_store(kcxt, temp.float8_v,
+                        tup_dclass[4],
+                        tup_values[4]);
+    if (tup_extras)
+      tup_extras[4] = sz;
+    extra_sum += MAXALIGN(sz);
+    if (offset > 0)
+      pg_datum_ref_arrow(kcxt,temp.text_v,kds_src,5,offset-1);
+    else
+      pg_datum_ref(kcxt,temp.text_v,NULL);
+    sz = pg_datum_store(kcxt, temp.text_v,
+                        tup_dclass[5],
+                        tup_values[5]);
+    if (tup_extras)
+      tup_extras[5] = sz;
+    extra_sum += MAXALIGN(sz);
+  }
+  /* ---- extract inner relation (depth=1) */
+  kds_in = KERN_MULTIRELS_INNER_KDS(kmrels, 1);
+  assert(kds_in->format == KDS_FORMAT_ROW ||
+         kds_in->format == KDS_FORMAT_HASH);
+  offset = r_buffer[1];
+  if (offset == 0)
+  {
+    tup_dclass[6] = DATUM_CLASS__NULL;
+    tup_dclass[7] = DATUM_CLASS__NULL;
+  }
+  else
+  {
+    htup = KDS_ROW_REF_HTUP(kds_in,offset,&t_self,NULL);
+    EXTRACT_HEAP_TUPLE_BEGIN(addr, kds_in, htup);
+    EXTRACT_HEAP_READ_64BIT(addr,tup_dclass[6],tup_values[6]);
+    EXTRACT_HEAP_TUPLE_NEXT(addr);
+    EXTRACT_HEAP_READ_POINTER(addr,tup_dclass[7],tup_values[7]);
+    EXTRACT_HEAP_TUPLE_END();
+  }
+  return extra_sum;
+}
+

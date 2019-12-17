@@ -2,6 +2,7 @@
 #include <string.h>
 #include <unistd.h>
 #include <getopt.h>
+#include <libgen.h>
 #include <sys/mman.h>
 #include <sys/types.h>
 #include <sys/stat.h>
@@ -37,8 +38,9 @@ int main(int argc, char *argv[])
 	const char	   *ptx_file = NULL;
 	nvrtcProgram	prog;
 	nvrtcResult		rc, status;
-	const char	   *options[40];
+	const char	   *options[100];
 	int				numopts = 0;
+	int				debug_flags = 0;
 	int				c;
 	size_t			sz;
 	char		   *temp;
@@ -48,21 +50,36 @@ int main(int argc, char *argv[])
 
 	argv0 = basename(strdup(argv[0]));
 
+	options[numopts++] = "-D__" CPU_ARCH "__=1";
 	options[numopts++] = "-I " CUDA_INCLUDE_DIR;
+#ifdef PGSHAREDIR
+	options[numopts++] = "-I " PGSHAREDIR "/pg_strom";
+#endif
+#ifdef PGSERV_INCLUDEDIR
+	options[numopts++] = "-I " PGSERV_INCLUDEDIR;
+#endif
 	options[numopts++] = "--gpu-architecture=compute_60";
-	while ((c = getopt(argc, argv, "o:I:D:")) != -1)
+	while ((c = getopt(argc, argv, "o:I:D:d")) != -1)
 	{
 		switch (c)
 		{
 			case 'I':
 				temp = __malloc(strlen(optarg) + 10);
-				sprintf(temp, "-I '%s'", optarg);
+				sprintf(temp, "-I %s", optarg);
 				options[numopts++] = temp;
 				break;
 			case 'D':
 				temp = __malloc(strlen(optarg) + 10);
-				sprintf(temp, "-D '%s'", optarg);
+				sprintf(temp, "-D %s", optarg);
 				options[numopts++] = temp;
+				break;
+			case 'd':
+				if (!debug_flags)
+				{
+					options[numopts++] = "--device-debug";
+					options[numopts++] = "--generate-line-info";
+					debug_flags = 1;
+				}
 				break;
 			case 'o':
 				ptx_file = optarg;
@@ -72,6 +89,10 @@ int main(int argc, char *argv[])
 				break;
 		}
 	}
+	options[numopts++] = "--use_fast_math";
+	options[numopts++] = "--device-c";
+	options[numopts++] = "--std=c++11";
+
 	if (optind + 1 != argc)
 		usage();
 	src_file = argv[optind];
