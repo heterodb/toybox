@@ -18,7 +18,7 @@ typedef struct
 } cudaIpcMemInfo;
 
 static int		num_segments = 4;
-static size_t	segment_sz = 128UL << 20;	/* 128MB */
+static size_t	segment_sz = 32UL << 20;	/* 128MB */
 static cudaIpcMemInfo *cuda_ipc_mem_info = MAP_FAILED;
 
 #define Elog(fmt,...)										\
