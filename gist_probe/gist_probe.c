@@ -47,7 +47,7 @@ dump_gist_page(char *base, Relation irel, BlockNumber blkno,
 	PageHeader		page = (PageHeader)(base + BLCKSZ * blkno);
 	GISTPageOpaque	op = GistPageGetOpaque((Page)page);
 	OffsetNumber	i, maxoff;
-	bool			is_leaf = ((op->flags & 1) != 0);
+	bool			is_leaf = ((op->flags & F_LEAF) != 0);
 
 	dump_tupdesc(RelationGetDescr(irel));
 	elog(INFO, "PageHeader[%d] pd_lsn=%u:%d pd_checksum=%02x pd_flags=%02x pd_pagesize_version=%d pd_prune_xid=%u",
@@ -104,6 +104,33 @@ dump_gist_page(char *base, Relation irel, BlockNumber blkno,
 	}
 }
 
+static void
+gist_make_tree(char *base, BlockNumber blkno,
+			   BlockNumber parent_blkno, OffsetNumber parent_offno)
+{
+	PageHeader		page = (PageHeader)(base + BLCKSZ * blkno);
+	GISTPageOpaque	op = GistPageGetOpaque((Page)page);
+    OffsetNumber    i, maxoff;
+
+	page->pd_lsn.xlogid  = parent_blkno;
+	page->pd_lsn.xrecoff = parent_offno;
+	if ((op->flags & F_LEAF) != 0)
+		return;
+
+	maxoff = PageGetMaxOffsetNumber(page);
+	for (i=FirstOffsetNumber; i <= maxoff; i = OffsetNumberNext(i))
+	{
+		ItemId		iid = PageGetItemId(page, i);
+        IndexTuple	it;
+
+		if (ItemIdIsDead(iid))
+			continue;
+		it = (IndexTuple) PageGetItem(page, iid);
+		gist_make_tree(base, BlockIdGetBlockNumber(&it->t_tid.ip_blkid),
+					   blkno, i);
+	}
+}
+
 Datum gist_probe(PG_FUNCTION_ARGS)
 {
 	Oid			index_oid = PG_GETARG_OID(0);
@@ -126,15 +153,21 @@ Datum gist_probe(PG_FUNCTION_ARGS)
 	{
 		Buffer	buffer;
 		Page	page;
+		PageHeader hpage;
 
 		buffer = ReadBuffer(irel, i);
 		LockBuffer(buffer, BUFFER_LOCK_SHARE);
 		page = BufferGetPage(buffer);
+		hpage = (PageHeader)(base + BLCKSZ * i);
 
-		memcpy(base + BLCKSZ * i, page, BLCKSZ);
+		memcpy(hpage, page, BLCKSZ);
+		hpage->pd_lsn.xlogid = InvalidBlockNumber;
+		hpage->pd_lsn.xrecoff = InvalidOffsetNumber;
 
 		UnlockReleaseBuffer(buffer);
 	}
+	gist_make_tree(base, 0, InvalidBlockNumber, InvalidOffsetNumber);
+	
 	dump_gist_page(base, irel, 0, 0, x, y);
 
 
