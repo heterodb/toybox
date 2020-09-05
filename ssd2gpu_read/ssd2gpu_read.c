@@ -287,6 +287,9 @@ exec_nvidia_p2pread(void *arg)
 								sz,
 								foffset + i,
 								doffset + i);
+			if (nbytes != sz)
+				Elog("cuFileRead returned %zd, for sz=%zu at foffset=%lu of %lu",
+					 nbytes, sz, foffset + i, filesize);
 		}
 	}
 	return NULL;
@@ -381,25 +384,3 @@ int main(int argc, char * const argv[])
 	printf("file [%s] read %.3fms throughput: %.2fMB/s\n",
 		   filename, duration, (double)filesize / (1000.0 * duration));
 }
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
