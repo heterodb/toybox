@@ -105,6 +105,7 @@ static bool			pcapture_udp_ipv6;
 static bool			pcapture_icmp_ipv6;
 static int			num_threads = -1;
 static int			num_pcap_threads = -1;
+static char		   *bpf_filter_rule = NULL;
 static size_t		output_filesize_limit = 0UL;				/* No limit */
 static size_t		record_batch_threshold = (128UL << 20);		/* 128MB */
 static bool			enable_direct_io = false;
@@ -981,9 +982,7 @@ usage(int status)
 		  "        months : switch at the next month\n"
 		  "  -l|--limit=<LIMIT> : (default: no limit)\n"
 		  "  -s|--chunk-size=<SIZE> : size of record batch (default: 128MB)\n"
-#if 0
 		  "  -r|--rule=<RULE> : packet filtering rules\n"
-#endif
 		  "     --direct-io : enables O_DIRECT for write-i/o\n"
 		  "     --hugetlb : try to use hugepages for buffers\n"
 		  "  -h|--help    : shows this message"
@@ -1004,9 +1003,7 @@ parse_options(int argc, char *argv[])
 		{"duration",   required_argument, NULL, 'd'},
 		{"limit",      required_argument, NULL, 'l'},
 		{"chunk-size", required_argument, NULL, 's'},
-#if 0
 		{"rule",       required_argument, NULL, 'r'},
-#endif
 		{"pcap-threads", required_argument, NULL, 1000},
 		{"direct-io",  no_argument,       NULL, 1001},
 		{"hugetlb",    no_argument,       NULL, 1002},
@@ -1018,7 +1015,7 @@ parse_options(int argc, char *argv[])
 	bool	output_has_seqno = false;
 	char   *pos;
 
-	while ((code = getopt_long(argc, argv, "i:o:p:t:d:l:s:",
+	while ((code = getopt_long(argc, argv, "i:o:p:t:d:l:s:r:",
 							   long_options, NULL)) >= 0)
 	{
 		char	   *token, *end;
@@ -1123,11 +1120,9 @@ parse_options(int argc, char *argv[])
 					Elog("unknown unit size '%s' in -s|--chunk-size option",
 						 optarg);
 				break;
-#if 0
 			case 'r':	/* rule */
-				/* TODO, in the future version */
+				bpf_filter_rule = pstrdup(optarg);
 				break;
-#endif
 			case 1001:	/* --direct-io */
 				enable_direct_io = true;
 				break;
@@ -1282,7 +1277,7 @@ pcap2arrow_open_files(void)
 	if (enable_direct_io)
 		flags |= O_DIRECT;
 
-	assert((protocol_mask & PCAP_PROTO__PACKET) != 0);
+	assert((protocol_mask & PCAP_PROTO_MASK__PACKET) != 0);
 	for (i=0; pcap_protocol_catalog[i].proto_name != NULL; i++)
 	{
 		int		proto = pcap_protocol_catalog[i].proto;
@@ -1375,6 +1370,13 @@ int main(int argc, char *argv[])
 		rv = pfring_set_socket_mode(pd, recv_only_mode);
 		if (rv)
 			Elog("failed on pfring_set_socket_mode");
+
+		if (bpf_filter_rule)
+		{
+			rv = pfring_set_bpf_filter(pd, bpf_filter_rule);
+			if (rv)
+				Elog("failed on pfring_set_bpf_filter");
+		}
 
 		rv = pfring_enable_ring(pd);
 		if (rv)
