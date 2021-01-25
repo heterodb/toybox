@@ -20,7 +20,6 @@
 #include <unistd.h>
 #include "arrow_ipc.h"
 
-
 #define PCAP_PROTO__PACKET			0
 #define PCAP_PROTO__RAW_IPv4		1
 #define PCAP_PROTO__TCP_IPv4		2
@@ -96,6 +95,14 @@ static char		   *input_pathname = NULL;
 static char		   *output_filename = "/tmp/pcap_%y%m%d_%H:%M:%S_%i_%p.arrow";
 static long			duration_to_switch = 0;			/* not switch */
 static int			protocol_mask = PCAP_PROTO_MASK__DEFAULT;
+static bool			pcapture_raw_ipv4;
+static bool			pcapture_tcp_ipv4;
+static bool			pcapture_udp_ipv4;
+static bool			pcapture_icmp_ipv4;
+static bool			pcapture_raw_ipv6;
+static bool			pcapture_tcp_ipv6;
+static bool			pcapture_udp_ipv6;
+static bool			pcapture_icmp_ipv6;
 static int			num_threads = -1;
 static int			num_pcap_threads = -1;
 static size_t		output_filesize_limit = 0UL;				/* No limit */
@@ -126,6 +133,16 @@ static long			PAGESIZE;
 static long			NCPUS;
 static bool			do_shutdown = false;
 static __thread int	worker_id = -1;
+
+#if __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
+#define __ntoh16(x)			__builtin_bswap16(x)
+#define __ntoh32(x)			__builtin_bswap32(x)
+#define __ntoh64(x)			__builtin_bswap64(x)
+#else
+#define __ntoh16(x)			(x)
+#define __ntoh32(x)			(x)
+#define __ntoh64(x)			(x)
+#endif
 
 /*
  * SIGINT handler
@@ -673,9 +690,119 @@ static const struct {
 
 #undef __ARROW_FIELD_INIT
 
+/*
+ * handlePacketRawEthernet
+ */
+static void
+handlePacketRawEthernet(pcapWorkerTask *pw_task,
+						struct pfring_pkthdr *hdr, u_char *buffer)
+{
+}
 
+/*
+ * handlePacketRawIPv4
+ */
+static bool
+handlePacketRawIPv4(pcapWorkerTask *pw_task,
+					struct pfring_pkthdr *hdr, u_char *buffer)
+{
+	return true;
+}
 
+/*
+ * handlePacketTcpIPv4
+ */
+static bool
+handlePacketTcpIPv4(pcapWorkerTask *pw_task,
+					struct pfring_pkthdr *hdr, u_char *buffer)
+{
+	return true;
+}
 
+/*
+ * handlePacketUdpIPv4
+ */
+static bool
+handlePacketUdpIPv4(pcapWorkerTask *pw_task,
+                    struct pfring_pkthdr *hdr, u_char *buffer)
+{
+	return true;
+}
+
+/*
+ * handlePacketIcmpIPv4
+ */
+static bool
+handlePacketIcmpIPv4(pcapWorkerTask *pw_task,
+					 struct pfring_pkthdr *hdr, u_char *buffer)
+{
+	return true;
+}
+
+/*
+ * pcapCapturePackets
+ */
+static int
+pcapCapturePackets(pcapWorkerTask *pw_task)
+{
+	struct pfring_pkthdr hdr;
+	u_char		__buffer[5000];
+	u_char	   *buffer = __buffer;
+	int			rv;
+
+	while (!do_shutdown)
+	{
+		rv = pfring_recv(pd, &buffer, sizeof(__buffer), &hdr, 1);
+		if (rv > 0)
+		{
+			uint16_t	ether_type = __ntoh16(*((uint16_t *)(buffer + 12)));
+			uint8_t		ip_version = (buffer[14] & 0xf0);
+
+			printf("ether_type = %04x ip_version = %02x\n", ether_type, ip_version);
+			if (ether_type == 0x0800 && ip_version == 0x40)
+			{
+				uint8_t		proto = buffer[14 + 9];		/* IPv4 Protocol */
+
+				if (proto == 0x06 && pcapture_tcp_ipv4 &&
+					hdr.caplen >= 14 + 20 + 20)			/* TCP/IPv4 */
+				{
+					if (handlePacketTcpIPv4(pw_task, &hdr, buffer))
+						continue;
+				}
+				else if (proto == 0x11 && pcapture_udp_ipv4 &&
+						 hdr.caplen >= 14 + 20 + 8)		/* UDP/IPv4 */
+				{
+					if (handlePacketUdpIPv4(pw_task, &hdr, buffer))
+						continue;
+				}
+				else if (proto == 0x01 && pcapture_icmp_ipv4 &&
+						 hdr.caplen >= 14 + 20 + 8)		/* ICMP/IPv4 */
+				{
+					if (handlePacketIcmpIPv4(pw_task, &hdr, buffer))
+						continue;
+				}
+				/* not TCP/UDP/ICMP, so save as Raw IPv4 */
+				if (handlePacketRawIPv4(pw_task, &hdr, buffer))
+					continue;
+			}
+#if 0
+			else if (ether_type == 0x86dd && ip_version == 0x60)	/* IPv6 */
+			{
+				//do IPv6 handling
+			}
+#endif
+			if (hdr.caplen < 14)
+			{
+				fprintf(stderr, "worker-%d captured too short packet (sz=%u), ignored\n",
+						worker_id, hdr.caplen);
+			}
+			/* elsewhere, all we can capture is hardware ether net packets */
+			handlePacketRawEthernet(pw_task, &hdr, buffer);
+		}
+	}
+	//flush pending packets
+	return -1;
+}
 
 /*
  * pcapAllocChunkBuffer
@@ -711,49 +838,6 @@ pcapAllocChunkBuffer(int proto)
 			pcap_protocol_catalog[proto].proto_schema(chunk->columns);
 	}
 	return chunk;
-}
-
-/*
- * pcapCapturePackets
- */
-static int
-pcapCapturePackets(pcapWorkerTask *pw_task)
-{
-	struct pfring_pkthdr hdr;
-	u_char		__buffer[5000];
-	u_char	   *buffer = __buffer;
-	int			rv;
-
-	while (!do_shutdown)
-	{
-		rv = pfring_recv(pd, &buffer, sizeof(__buffer), &hdr, 1);
-		if (do_shutdown)
-			return -1;		/* urgent case */
-		if (rv > 0)
-		{
-			struct tm	__tm;
-
-			localtime_r(&hdr.ts.tv_sec, &__tm);
-
-			printf("worker-%d: [%02d:%02d:%02d] packet cap=%u len=%u [%08x,%08x,%08x,%08x %08x,%08x,%08x,%08x]\n",
-				   worker_id,
-				   __tm.tm_hour,
-				   __tm.tm_min,
-				   __tm.tm_sec,
-				   hdr.caplen,
-				   hdr.len,
-				   ((uint32_t *)buffer)[0],
-				   ((uint32_t *)buffer)[1],
-				   ((uint32_t *)buffer)[2],
-				   ((uint32_t *)buffer)[3],
-				   ((uint32_t *)buffer)[4],
-				   ((uint32_t *)buffer)[5],
-				   ((uint32_t *)buffer)[6],
-				   ((uint32_t *)buffer)[7]);
-		}
-	}
-	//flush pending packets
-	return -1;
 }
 
 /*
@@ -1097,6 +1181,16 @@ parse_options(int argc, char *argv[])
 		num_threads = 2 * NCPUS;
 	if (num_pcap_threads < 0)
 		num_pcap_threads = NCPUS;
+
+	/* just for convenience */
+	pcapture_raw_ipv4 = ((protocol_mask & PCAP_PROTO_MASK__RAW_IPv4) != 0);
+	pcapture_tcp_ipv4 = ((protocol_mask & PCAP_PROTO_MASK__TCP_IPv4) != 0);
+	pcapture_udp_ipv4 = ((protocol_mask & PCAP_PROTO_MASK__UDP_IPv4) != 0);
+	pcapture_icmp_ipv4 = ((protocol_mask & PCAP_PROTO_MASK__ICMP_IPv4) != 0);
+	pcapture_raw_ipv6 = ((protocol_mask & PCAP_PROTO_MASK__RAW_IPv4) != 0);
+	pcapture_tcp_ipv6 = ((protocol_mask & PCAP_PROTO_MASK__TCP_IPv4) != 0);
+	pcapture_udp_ipv6 = ((protocol_mask & PCAP_PROTO_MASK__UDP_IPv4) != 0);
+	pcapture_icmp_ipv6 = ((protocol_mask & PCAP_PROTO_MASK__ICMP_IPv4) != 0);
 }
 
 /*
@@ -1187,7 +1281,8 @@ pcap2arrow_open_files(void)
 	localtime_r(&t, &tm);
 	if (enable_direct_io)
 		flags |= O_DIRECT;
-	assert((protocol_mask & PCAP_PROTO_MASK__DEFAULT) != 0);
+
+	assert((protocol_mask & PCAP_PROTO__PACKET) != 0);
 	for (i=0; pcap_protocol_catalog[i].proto_name != NULL; i++)
 	{
 		int		proto = pcap_protocol_catalog[i].proto;
