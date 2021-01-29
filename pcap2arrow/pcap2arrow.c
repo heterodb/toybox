@@ -61,8 +61,14 @@ typedef struct arrowChunkBuffer		arrowChunkBuffer;
  */
 struct arrowFileDesc
 {
-	pthread_mutex_t	mutex;		/* mutex to protect the table below */
-	SQLtable		table;		/* to track RecordBatch array */
+	arrowFileDesc  *next;		/* for arrow_file_desc_closing */
+	int				refcnt;
+	int				fdesc;
+	const char	   *filename;
+	volatile off_t	f_pos;
+	pthread_mutex_t	mutex;		/* mutex for the fields below */
+	int				numRecordBatches;
+	ArrowBlock	   *recordBatches;
 };
 
 /*
@@ -70,11 +76,8 @@ struct arrowFileDesc
  */
 struct arrowChunkBuffer
 {
-	arrowChunkBuffer *next;		/* for arrow_chunk_buffer_pending */
 	size_t			usage;
-	size_t			nitems;
-	int				nfields;
-	SQLfield		columns[FLEXIBLE_ARRAY_MEMBER];
+	SQLtable		table;
 };
 
 /*
@@ -91,7 +94,7 @@ static int			protocol_mask = PCAP_PROTO__DEFAULT;
 static int			num_threads = -1;
 static int			num_pcap_threads = -1;
 static char		   *bpf_filter_rule = NULL;
-static size_t		output_filesize_limit = 0UL;				/* No limit */
+static size_t		output_filesize_limit = ULONG_MAX;			/* No Limit */
 static size_t		record_batch_threshold = (128UL << 20);		/* 128MB */
 static bool			enable_direct_io = false;
 static bool			only_headers = false;
@@ -100,10 +103,10 @@ static bool			only_headers = false;
 static pfring		   *pd = NULL;
 static volatile bool	do_shutdown = false;
 static pthread_mutex_t	arrow_file_desc_lock;
+static pthread_cond_t	arrow_file_desc_cond;
 static arrowFileDesc   *arrow_file_desc_current = NULL;
-static arrowChunkBuffer *arrow_chunk_buffer_pending = NULL;
-static char			   *arrow_file_head_image = NULL;
-static size_t			arrow_file_head_length = 0;
+static arrowFileDesc   *arrow_file_desc_closing = NULL;
+static arrowChunkBuffer **arrow_chunk_buffer_array;
 static sem_t			pcap_worker_sem;
 
 /* static variables for PCAP file scan mode */
@@ -173,6 +176,15 @@ static inline uint64_t
 atomicAdd64(volatile uint64_t *addr, uint64_t value)
 {
 	return __atomic_fetch_add(addr, value, __ATOMIC_SEQ_CST);
+}
+
+static inline off_t
+atomicCAS64(volatile off_t *addr, off_t comp, off_t value)
+{
+	return __atomic_compare_exchange_n(addr, &comp, value,
+									   false,
+									   __ATOMIC_SEQ_CST,
+									   __ATOMIC_SEQ_CST);
 }
 
 /*
@@ -743,7 +755,7 @@ arrowSchemaInitFields(SQLfield *columns)
 	size_t      usage = 0
 #define __FIELD_PUT_VALUE(NAME,ADDR,SZ)									\
 	Assert(arrow_cindex__##NAME >= 0);									\
-	__field = &chunk->columns[arrow_cindex__##NAME];					\
+	__field = &chunk->table.columns[arrow_cindex__##NAME];				\
 	usage += __field->put_value(__field, (const char *)(ADDR),(SZ))
 
 /*
@@ -1016,18 +1028,20 @@ handlePacketPayload(arrowChunkBuffer *chunk, u_char *buf, size_t sz)
  * arrowOpenOutputFile
  */
 static arrowFileDesc *
-arrowOpenOutputFile(void)
+arrowOpenOutputFile(arrowChunkBuffer *chunk)
 {
 	static int	output_file_seqno = 1;
 	time_t		tv = time(NULL);
 	struct tm	tm;
 	char	   *path, *pos;
 	int			off, sz = 256;
+	int			retry_count = 0;
 	int			fdesc, flags;
 	arrowFileDesc *outfd;
 
 	/* build a filename */
 	localtime_r(&tv, &tm);
+retry:
 	do {
 		off = 0;
 		path = alloca(sz);
@@ -1040,32 +1054,41 @@ arrowOpenOutputFile(void)
 				switch (*pos)
 				{
 					case 'i':
-						off += snprintf(path+off, sz-off, "%s", input_pathname);
+						off += snprintf(path+off, sz-off,
+										"%s", input_pathname);
 						break;
 					case 'Y':
-						off += snprintf(path+off, sz-off, "%04d", tm.tm_year + 1900);
+						off += snprintf(path+off, sz-off,
+										"%04d", tm.tm_year + 1900);
 						break;
 					case 'y':
-						off += snprintf(path+off, sz-off, "%02d", tm.tm_year % 100);
+						off += snprintf(path+off, sz-off,
+										"%02d", tm.tm_year % 100);
 						break;
 					case 'm':
-						off += snprintf(path+off, sz-off, "%02d", tm.tm_mon + 1);
+						off += snprintf(path+off, sz-off,
+										"%02d", tm.tm_mon + 1);
 						break;
 					case 'd':
-						off += snprintf(path+off, sz-off, "%02d", tm.tm_mday);
+						off += snprintf(path+off, sz-off,
+										"%02d", tm.tm_mday);
 						break;
 					case 'H':
-						off += snprintf(path+off, sz-off, "%02d", tm.tm_hour);
+						off += snprintf(path+off, sz-off,
+										"%02d", tm.tm_hour);
 						break;
 					case 'M':
-						off += snprintf(path+off, sz-off, "%02d", tm.tm_min);
+						off += snprintf(path+off, sz-off,
+										"%02d", tm.tm_min);
 						break;
 					case 'S':
-						off += snprintf(path+off, sz-off, "%02d", tm.tm_sec);
+						off += snprintf(path+off, sz-off,
+										"%02d", tm.tm_sec);
 						break;
 					case 'q':
-						off += snprintf(path+off, sz-off, "%d", output_file_seqno);
-					break;
+						off += snprintf(path+off, sz-off,
+										"%d", output_file_seqno);
+						break;
 					default:
 						Elog("unexpected output file format '%%%c'", *pos);
 				}
@@ -1075,6 +1098,9 @@ arrowOpenOutputFile(void)
 				path[off++] = *pos;
 			}
 		}
+		if (retry_count > 0)
+			off += snprintf(path+off, sz-off,
+							".%d", retry_count);
 		if (off < sz)
 			path[off++] = '\0';
 	} while (off >= sz);
@@ -1085,49 +1111,33 @@ arrowOpenOutputFile(void)
 		flags |= O_DIRECT;
 	fdesc = open(path, flags);
 	if (fdesc < 0)
+	{
+		if (errno == EEXIST)
+		{
+			retry_count++;
+			goto retry;
+		}
 		Elog("failed to open('%s'): %m", path);
+	}
 
 	/* setup arrowFileDesc */
-	outfd = palloc0(offsetof(arrowFileDesc,
-							 table.columns[PCAP_SCHEMA_MAX_NFIELDS]));
-	pthreadMutexInit(&outfd->mutex);
-	outfd->table.filename = pstrdup(path);
-	outfd->table.fdesc = fdesc;
-	outfd->table.f_pos = 0;
-	outfd->table.segment_sz = record_batch_threshold;
-	outfd->table.nfields = arrowSchemaInitFields(outfd->table.columns);
-
-	/* write out header portion */
-	if (arrow_file_head_image)
+	outfd = palloc0(sizeof(arrowFileDesc));
+	outfd->refcnt = 0;
+	outfd->fdesc = fdesc;
+	outfd->filename = pstrdup(path);
+	if (!chunk)
 	{
-		arrowFileWrite(&outfd->table, arrow_file_head_image, arrow_file_head_length);
+		Assert(worker_id < 0);		/* only happen if main thread */
+		chunk = arrow_chunk_buffer_array[0];
 	}
-	else
-	{
-		ssize_t		nbytes, offset = 0;
+	chunk->table.fdesc    = outfd->fdesc;
+	chunk->table.filename = outfd->filename;
+	chunk->table.f_pos    = 0;
+	arrowFileWrite(&chunk->table, "ARROW1\0\0", 8);
+	writeArrowSchema(&chunk->table);
 
-		arrowFileWrite(&outfd->table, "ARROW1\0\0", 8);
-		writeArrowSchema(&outfd->table);
+	outfd->f_pos = chunk->table.f_pos;
 
-		arrow_file_head_length = outfd->table.f_pos;
-		printf("arrow_file_head_length = %zu\n", arrow_file_head_length);
-		arrow_file_head_image = palloc(arrow_file_head_length);
-
-		while (offset < arrow_file_head_length)
-		{
-			nbytes = pread(fdesc, (char *)arrow_file_head_image + offset,
-						   arrow_file_head_length - offset, offset);
-			if (nbytes < 0)
-			{
-				if (errno == EINTR)
-					continue;
-				Elog("failed on pread('%s'): %m", path);
-			}
-			else if (nbytes == 0)
-				Elog("unexpected EOF at pread('%s')", path);
-			offset += nbytes;
-		}
-	}
 	return outfd;
 }
 
@@ -1137,7 +1147,51 @@ arrowOpenOutputFile(void)
 static void
 arrowChunkWriteOut(arrowChunkBuffer *chunk)
 {
+	arrowFileDesc *outfd = NULL;
+	off_t		base;
 
+	pthreadMutexLock(&arrow_file_desc_lock);
+	outfd = arrow_file_desc_current;
+	base = outfd->f_pos;
+	if (base < output_filesize_limit)
+	{
+		/* Ok, [base ... base + usage) is reserved */
+		chunk->table.fdesc = outfd->fdesc;
+		chunk->table.filename = outfd->filename;
+		chunk->table.f_pos = base;
+
+		outfd->f_pos += chunk->usage;
+		outfd->refcnt++;
+	}
+	else
+	{
+		/* switch the output file, then retry */
+		outfd->next = arrow_file_desc_closing;
+        arrow_file_desc_closing = outfd;
+		if (outfd->refcnt == 0)
+			pthreadCondBroadcast(&arrow_file_desc_cond);
+
+		arrow_file_desc_current = arrowOpenOutputFile(chunk);
+	}
+	pthreadMutexUnlock(&arrow_file_desc_lock);
+
+	//atomic write
+
+
+	
+	//ExecArrowChunkWriteOut
+	
+	
+	pthreadMutexLock(&arrow_file_desc_lock);
+	Assert(outfd->refcnt > 0);
+	outfd->refcnt--;
+	if (outfd->refcnt == 0)
+		pthreadCondBroadcast(&arrow_file_desc_cond);
+	pthreadMutexUnlock(&arrow_file_desc_lock);
+
+	chunk->table.fdesc = -1;
+	chunk->table.filename = NULL;
+	chunk->table.f_pos = 0;
 }
 
 /*
@@ -1256,10 +1310,10 @@ execCapturePackets(arrowChunkBuffer *chunk)
 	int			j, rv;
 
 	/* clear the chunk-buffer */
-	for (j=0; j < chunk->nfields; j++)
-		sql_field_clear(&chunk->columns[j]);
+	for (j=0; j < chunk->table.nfields; j++)
+		sql_field_clear(&chunk->table.columns[j]);
 	chunk->usage = 0;
-	chunk->nitems = 0;
+	chunk->table.nitems = 0;
 
 	while (!do_shutdown)
 	{
@@ -1285,11 +1339,7 @@ pcap_worker_main(void *__arg)
 
 	/* assign worker-id of this thread */
 	worker_id = (long)__arg;
-
-	/* allocation of local chunk buffer */
-	chunk = palloc0(offsetof(arrowChunkBuffer,
-							 columns[PCAP_SCHEMA_MAX_NFIELDS]));
-	chunk->nfields = arrowSchemaInitFields(chunk->columns);
+	chunk = arrow_chunk_buffer_array[worker_id];
 
 	while (!do_shutdown)
 	{
@@ -1319,20 +1369,6 @@ pcap_worker_main(void *__arg)
 			 * so, write out by itself.
 			 */
 			arrowChunkWriteOut(chunk);
-		}
-		else if (status == 0)
-		{
-			/*
-			 * execCapturePackets() was interrupted by do_shutdown.
-			 * so, final chunk shall be merged by the main thread.
-			 */
-			Assert(do_shutdown);
-			pthreadMutexLock(&arrow_file_desc_lock);
-			chunk->next = arrow_chunk_buffer_pending;
-			arrow_chunk_buffer_pending = chunk;
-			pthreadMutexUnlock(&arrow_file_desc_lock);
-
-			break;
 		}
 	}
 	return NULL;
@@ -1396,7 +1432,6 @@ parse_options(int argc, char *argv[])
 		{NULL, 0, NULL, 0}
 	};
 	int		code;
-	bool	output_has_seqno = false;
 	char   *pos;
 
 	while ((code = getopt_long(argc, argv, "i:o:p:t:l:s:r:h",
@@ -1472,6 +1507,8 @@ parse_options(int argc, char *argv[])
 				else if (*pos != '\0')
 					Elog("unknown unit size '%s' in -l|--limit option",
 						 optarg);
+				if (output_filesize_limit < (64UL << 20))
+					Elog("output filesize limit too small (should be > 64MB))");
 				break;
 
 			case 's':	/* chunk-size */
@@ -1512,8 +1549,6 @@ parse_options(int argc, char *argv[])
 			switch (*pos)
 			{
 				case 'q':
-					output_has_seqno = true;
-					break;
 				case 'i':
 				case 'Y':
 				case 'y':
@@ -1531,8 +1566,6 @@ parse_options(int argc, char *argv[])
 			}
 		}
 	}
-	if (output_filesize_limit != 0 && !output_has_seqno)
-		Elog("-o|--output must has '%%q' to split files when it exceeds the threshold");
 	if (num_threads < 0)
 		num_threads = 2 * NCPUS;
 	if (num_pcap_threads < 0)
@@ -1551,7 +1584,24 @@ int main(int argc, char *argv[])
 
 	/* parse command line options */
 	parse_options(argc, argv);
+	/* chunk-buffer pre-allocation */
+	arrow_chunk_buffer_array = palloc0(sizeof(arrowChunkBuffer *) * num_threads);
+	for (i=0; i < num_threads; i++)
+	{
+		arrowChunkBuffer *chunk;
 
+		chunk = palloc0(offsetof(arrowChunkBuffer,
+								 table.columns[PCAP_SCHEMA_MAX_NFIELDS]));
+		chunk->table.nfields = arrowSchemaInitFields(chunk->table.columns);
+		arrow_chunk_buffer_array[i] = chunk;
+	}
+	/* open the output file, and misc init stuff */
+	arrow_file_desc_current = arrowOpenOutputFile(NULL);
+	pthreadMutexInit(&arrow_file_desc_lock);
+	pthreadCondInit(&arrow_file_desc_cond);
+	if (sem_init(&pcap_worker_sem, 0, num_pcap_threads) != 0)
+		Elog("failed on sem_init: %m");
+	
 	/*
 	 * If -i|--input is a regular file, we try to open & mmap pcap file,
 	 * for parallel transformation to Apache Arrow.
@@ -1602,12 +1652,6 @@ int main(int argc, char *argv[])
 		if (rv)
 			Elog("failed on pfring_enable_ring");
 	}
-	/* open the output file, and misc init stuff */
-	arrow_file_desc_current = arrowOpenOutputFile();
-	pthreadMutexInit(&arrow_file_desc_lock);
-	if (sem_init(&pcap_worker_sem, 0, num_pcap_threads) != 0)
-		Elog("failed on sem_init: %m");
-
 	/* ctrl-c handler */
 	signal(SIGINT, on_sigint_handler);
 	signal(SIGTERM, on_sigint_handler);
@@ -1620,6 +1664,10 @@ int main(int argc, char *argv[])
 		if (rv != 0)
 			Elog("failed on pthread_create: %s", strerror(rv));
 	}
+	/* wait for pending chunks */
+
+
+	
 	/* wait for completion */
 	for (i=0; i < num_threads; i++)
 	{
