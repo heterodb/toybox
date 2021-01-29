@@ -8,6 +8,7 @@
 #include <ctype.h>
 #include <fcntl.h>
 #include <getopt.h>
+#include <limits.h>
 #include <pcap.h>
 #include <pfring.h>
 #include <pthread.h>
@@ -60,10 +61,7 @@ typedef struct arrowChunkBuffer		arrowChunkBuffer;
  */
 struct arrowFileDesc
 {
-	volatile int	refcnt;		/* number of threads that refers this file */
-	int				seqno;		/* increment on output file switch */
-	pthread_mutex_t	mutex;
-	arrowChunkBuffer *pending;	/* to be written prior to file output */
+	pthread_mutex_t	mutex;		/* mutex to protect the table below */
 	SQLtable		table;		/* to track RecordBatch array */
 };
 
@@ -72,33 +70,23 @@ struct arrowFileDesc
  */
 struct arrowChunkBuffer
 {
-	arrowFileDesc  *afd;
-	arrowChunkBuffer *next;		/* for pending list */
-	int				nfields;
+	arrowChunkBuffer *next;		/* for arrow_chunk_buffer_pending */
+	size_t			usage;
 	size_t			nitems;
+	int				nfields;
 	SQLfield		columns[FLEXIBLE_ARRAY_MEMBER];
 };
 
 /*
  * misc definitions
  */
-#define MACADDR_LEN		6
-#define IP4ADDR_LEN		4
-#define IP6ADDR_LEN		16
-
-#define TCP_FLAGS__NS		0x0100
-#define TCP_FLAGS__CWR		0x0200
-#define TCP_FLAGS__ECE		0x0400
-#define TCP_FLAGS__URG		0x0800
-#define TCP_FLAGS__ACK		0x1000
-#define TCP_FLAGS__PSH		0x2000
-#define TCP_FLAGS__RST		0x4000
-#define TCP_FLAGS__FIN		0x8000
+#define MACADDR_LEN			6
+#define IP4ADDR_LEN			4
+#define IP6ADDR_LEN			16
 
 /* command-line options */
 static char		   *input_pathname = NULL;
 static char		   *output_filename = "/tmp/pcap_%i_%y%m%d_%H:%M:%S.arrow";
-static int			output_switch_interval = PCAP_SWITCH__NEVER;
 static int			protocol_mask = PCAP_PROTO__DEFAULT;
 static int			num_threads = -1;
 static int			num_pcap_threads = -1;
@@ -110,10 +98,12 @@ static bool			only_headers = false;
 
 /* static variable for PF-RING capture mode */
 static pfring		   *pd = NULL;
+static volatile bool	do_shutdown = false;
 static pthread_mutex_t	arrow_file_desc_lock;
-static pthread_cond_t	arrow_file_desc_cond;
 static arrowFileDesc   *arrow_file_desc_current = NULL;
-static arrowChunkBuffer *arrow_chunk_buffer_freelist = NULL;
+static arrowChunkBuffer *arrow_chunk_buffer_pending = NULL;
+static char			   *arrow_file_head_image = NULL;
+static size_t			arrow_file_head_length = 0;
 static sem_t			pcap_worker_sem;
 
 /* static variables for PCAP file scan mode */
@@ -122,16 +112,15 @@ static sem_t			pcap_worker_sem;
 #define PCAP_MAGIC__HOST_NS		0xa1b23c4dU
 #define PCAP_MAGIC__SWAP_NS		0x4d3cb2a1U
 
-static char		   *pcap_filemap = NULL;
-static uint32_t		pcap_file_magic = 0;
-static size_t		pcap_file_sz = 0UL;
-static uint64_t		pcap_file_read_pos = 0;
+static char			   *pcap_filemap = NULL;
+static uint32_t			pcap_file_magic = 0;
+static size_t			pcap_file_sz = 0UL;
+static uint64_t			pcap_file_read_pos = 0;
 
 /* other static variables */
-static long			PAGESIZE;
-static long			NCPUS;
-static bool			do_shutdown = false;
-static __thread int	worker_id = -1;
+static long				PAGESIZE;
+static long				NCPUS;
+static __thread int		worker_id = -1;
 
 #if __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
 #define __ntoh16(x)			__builtin_bswap16(x)
@@ -177,15 +166,14 @@ pthreadCondBroadcast(pthread_cond_t *cond)
 	if ((errno = pthread_cond_broadcast(cond)) != 0)
 		Elog("failed on pthread_cond_broadcast: %m");
 }
-
-
-
-
-
-
-
-
-
+/*
+ * atomic operations
+ */
+static inline uint64_t
+atomicAdd64(volatile uint64_t *addr, uint64_t value)
+{
+	return __atomic_fetch_add(addr, value, __ATOMIC_SEQ_CST);
+}
 
 /*
  * SIGINT handler
@@ -227,15 +215,6 @@ pcap_file_mmap(const char *pathname, struct stat *stat_buf)
 	pcap_file_read_pos = sizeof(struct pcap_file_header);
 
 	return (void *)pcap_head;
-}
-
-/*
- * atomic operations
- */
-static inline uint32_t
-atomicAdd32(uint32_t *addr, uint32_t value)
-{
-	return __atomic_fetch_add(addr, value, __ATOMIC_SEQ_CST);
 }
 
 /* ----------------------------------------------------------------
@@ -759,10 +738,13 @@ arrowSchemaInitFields(SQLfield *columns)
 	return j;
 }
 
+#define __FIELD_PUT_VALUE_DECL											\
+	SQLfield   *__field;												\
+	size_t      usage = 0
 #define __FIELD_PUT_VALUE(NAME,ADDR,SZ)									\
 	Assert(arrow_cindex__##NAME >= 0);									\
 	__field = &chunk->columns[arrow_cindex__##NAME];					\
-	__field->put_value(__field, (const char *)(ADDR),(SZ))
+	usage += __field->put_value(__field, (const char *)(ADDR),(SZ))
 
 /*
  * handlePacketRawEthernet
@@ -772,12 +754,12 @@ handlePacketRawEthernet(arrowChunkBuffer *chunk,
 						struct pfring_pkthdr *hdr,
 						u_char *buf, uint16_t *p_ether_type)
 {
+	__FIELD_PUT_VALUE_DECL;
 	struct __raw_ether {
 		u_char		dst_mac[6];
 		u_char		src_mac[6];
 		uint16_t	ether_type;
 	}		   *raw_ether = (struct __raw_ether *)buf;
-	SQLfield   *__field;
 
 	__FIELD_PUT_VALUE(timestamp, &hdr->ts, sizeof(hdr->ts));
 	if (hdr->caplen < sizeof(struct __raw_ether))
@@ -792,6 +774,8 @@ handlePacketRawEthernet(arrowChunkBuffer *chunk,
 	*p_ether_type = __ntoh16(raw_ether->ether_type);
 	__FIELD_PUT_VALUE(ether_type, p_ether_type, sizeof(uint16_t));
 
+	chunk->usage = usage;	/* raw-ethernet shall be 1st call */
+	
 	return buf + sizeof(struct __raw_ether);
 }
 
@@ -802,6 +786,7 @@ static u_char *
 handlePacketIPv4Header(arrowChunkBuffer *chunk,
 					   u_char *buf, size_t sz, uint8_t *p_proto)
 {
+	__FIELD_PUT_VALUE_DECL;
 	struct __ipv4_head {
 		uint8_t		version;	/* 4bit of version means header-size */
 		uint8_t		tos;
@@ -815,7 +800,6 @@ handlePacketIPv4Header(arrowChunkBuffer *chunk,
 		uint32_t	dst_addr;
 		char		ip_options[0];
 	}		   *ipv4 = (struct __ipv4_head *)buf;
-	SQLfield   *__field;
 	uint16_t	head_sz;
 
 	if (!buf || sz < 20)
@@ -846,6 +830,8 @@ handlePacketIPv4Header(arrowChunkBuffer *chunk,
 	{
 		__FIELD_PUT_VALUE(ip_options, NULL, 0);
 	}
+	chunk->usage += usage;
+
 	return buf + head_sz;
 
 fillup_by_null:
@@ -859,6 +845,7 @@ fillup_by_null:
 	__FIELD_PUT_VALUE(src_addr, NULL, 0);
 	__FIELD_PUT_VALUE(dst_addr, NULL, 0);
 	__FIELD_PUT_VALUE(ip_options, NULL, 0);
+	chunk->usage += usage;
 
 	return NULL;
 }
@@ -881,6 +868,7 @@ static u_char *
 handlePacketTcpHeader(arrowChunkBuffer *chunk,
 					  u_char *buf, size_t sz, int proto)
 {
+	__FIELD_PUT_VALUE_DECL;
 	struct __tcp_head {
 		uint16_t	src_port;
 		uint16_t	dst_port;
@@ -893,7 +881,6 @@ handlePacketTcpHeader(arrowChunkBuffer *chunk,
 		char		tcp_options[0];
 	}		   *tcp = (struct __tcp_head *)buf;
 	uint16_t	head_sz;
-	SQLfield   *__field;
 
 	if (!buf || sz < offsetof(struct __tcp_head, tcp_options))
 		goto fillup_by_null;
@@ -918,6 +905,7 @@ handlePacketTcpHeader(arrowChunkBuffer *chunk,
 	{
 		__FIELD_PUT_VALUE(tcp_options, NULL, 0);
 	}
+	chunk->usage += usage;
 	return buf + head_sz;
 
 fillup_by_null:
@@ -933,7 +921,7 @@ fillup_by_null:
 	__FIELD_PUT_VALUE(tcp_checksum, NULL, 0);
 	__FIELD_PUT_VALUE(urgent_ptr, NULL, 0);
 	__FIELD_PUT_VALUE(tcp_options, NULL, 0);
-
+	chunk->usage += usage;
 	return NULL;
 }
 
@@ -944,13 +932,13 @@ static u_char *
 handlePacketUdpHeader(arrowChunkBuffer *chunk,
 					  u_char *buf, size_t sz, int proto)
 {
+	__FIELD_PUT_VALUE_DECL;
 	struct __udp_head {
 		uint16_t	src_port;
 		uint16_t	dst_port;
 		uint16_t	segment_sz;
 		uint16_t	udp_checksum;
 	}		   *udp = (struct __udp_head *) buf;
-	SQLfield   *__field;
 
 	if (!buf || sz < sizeof(struct __udp_head))
 		goto fillup_by_null;
@@ -958,7 +946,7 @@ handlePacketUdpHeader(arrowChunkBuffer *chunk,
 	__FIELD_PUT_VALUE(dst_port,     &udp->dst_port,     sizeof(uint16_t));
 	__FIELD_PUT_VALUE(segment_sz,   &udp->segment_sz,   sizeof(uint16_t));
 	__FIELD_PUT_VALUE(udp_checksum, &udp->udp_checksum, sizeof(uint16_t));
-
+	chunk->usage += usage;
 	return buf + sizeof(struct __udp_head);
 
 fillup_by_null:
@@ -970,7 +958,7 @@ fillup_by_null:
 	}
 	__FIELD_PUT_VALUE(segment_sz, NULL, 0);
 	__FIELD_PUT_VALUE(udp_checksum, NULL, 0);
-
+	chunk->usage += usage;
 	return NULL;
 }
 
@@ -981,12 +969,12 @@ static u_char *
 handlePacketIcmpHeader(arrowChunkBuffer *chunk,
 					   u_char *buf, size_t sz, int proto)
 {
+	__FIELD_PUT_VALUE_DECL;
 	struct __icmp_head {
 		uint8_t		icmp_type;
 		uint8_t		icmp_code;
 		uint16_t	icmp_checksum;
 	}		   *icmp = (struct __icmp_head *) buf;
-	SQLfield   *__field;
 
 	if (!buf || sz < sizeof(struct __icmp_head))
 		goto fillup_by_null;
@@ -994,14 +982,14 @@ handlePacketIcmpHeader(arrowChunkBuffer *chunk,
 	__FIELD_PUT_VALUE(icmp_type,     &icmp->icmp_type, sizeof(uint8_t));
 	__FIELD_PUT_VALUE(icmp_code,     &icmp->icmp_code, sizeof(uint8_t));
 	__FIELD_PUT_VALUE(icmp_checksum, &icmp->icmp_checksum, sizeof(uint16_t));
-
+	chunk->usage += usage;
 	return buf + sizeof(struct __icmp_head);
 
 fillup_by_null:
 	__FIELD_PUT_VALUE(icmp_type,     NULL, 0);
 	__FIELD_PUT_VALUE(icmp_code,     NULL, 0);
 	__FIELD_PUT_VALUE(icmp_checksum, NULL, 0);
-
+	chunk->usage += usage;
 	return NULL;
 }
 
@@ -1011,7 +999,249 @@ fillup_by_null:
 static void
 handlePacketPayload(arrowChunkBuffer *chunk, u_char *buf, size_t sz)
 {
+	__FIELD_PUT_VALUE_DECL;
+	
+	if (buf && sz > 0)
+	{
+		__FIELD_PUT_VALUE(payload, buf, sz);
+	}
+	else
+	{
+		__FIELD_PUT_VALUE(payload, NULL, 0);
+	}
+	chunk->usage += usage;
+}
 
+/*
+ * arrowOpenOutputFile
+ */
+static arrowFileDesc *
+arrowOpenOutputFile(void)
+{
+	static int	output_file_seqno = 1;
+	time_t		tv = time(NULL);
+	struct tm	tm;
+	char	   *path, *pos;
+	int			off, sz = 256;
+	int			fdesc, flags;
+	arrowFileDesc *outfd;
+
+	/* build a filename */
+	localtime_r(&tv, &tm);
+	do {
+		off = 0;
+		path = alloca(sz);
+
+		for (pos = output_filename; *pos != '\0' && off < sz; pos++)
+		{
+			if (*pos == '%')
+			{
+				pos++;
+				switch (*pos)
+				{
+					case 'i':
+						off += snprintf(path+off, sz-off, "%s", input_pathname);
+						break;
+					case 'Y':
+						off += snprintf(path+off, sz-off, "%04d", tm.tm_year + 1900);
+						break;
+					case 'y':
+						off += snprintf(path+off, sz-off, "%02d", tm.tm_year % 100);
+						break;
+					case 'm':
+						off += snprintf(path+off, sz-off, "%02d", tm.tm_mon + 1);
+						break;
+					case 'd':
+						off += snprintf(path+off, sz-off, "%02d", tm.tm_mday);
+						break;
+					case 'H':
+						off += snprintf(path+off, sz-off, "%02d", tm.tm_hour);
+						break;
+					case 'M':
+						off += snprintf(path+off, sz-off, "%02d", tm.tm_min);
+						break;
+					case 'S':
+						off += snprintf(path+off, sz-off, "%02d", tm.tm_sec);
+						break;
+					case 'q':
+						off += snprintf(path+off, sz-off, "%d", output_file_seqno);
+					break;
+					default:
+						Elog("unexpected output file format '%%%c'", *pos);
+				}
+			}
+			else
+			{
+				path[off++] = *pos;
+			}
+		}
+		if (off < sz)
+			path[off++] = '\0';
+	} while (off >= sz);
+
+	/* open file */
+	flags = O_RDWR | O_CREAT | O_EXCL;
+	if (enable_direct_io)
+		flags |= O_DIRECT;
+	fdesc = open(path, flags);
+	if (fdesc < 0)
+		Elog("failed to open('%s'): %m", path);
+
+	/* setup arrowFileDesc */
+	outfd = palloc0(offsetof(arrowFileDesc,
+							 table.columns[PCAP_SCHEMA_MAX_NFIELDS]));
+	pthreadMutexInit(&outfd->mutex);
+	outfd->table.filename = pstrdup(path);
+	outfd->table.fdesc = fdesc;
+	outfd->table.f_pos = 0;
+	outfd->table.segment_sz = record_batch_threshold;
+	outfd->table.nfields = arrowSchemaInitFields(outfd->table.columns);
+
+	/* write out header portion */
+	if (arrow_file_head_image)
+	{
+		arrowFileWrite(&outfd->table, arrow_file_head_image, arrow_file_head_length);
+	}
+	else
+	{
+		ssize_t		nbytes, offset = 0;
+
+		arrowFileWrite(&outfd->table, "ARROW1\0\0", 8);
+		writeArrowSchema(&outfd->table);
+
+		arrow_file_head_length = outfd->table.f_pos;
+		printf("arrow_file_head_length = %zu\n", arrow_file_head_length);
+		arrow_file_head_image = palloc(arrow_file_head_length);
+
+		while (offset < arrow_file_head_length)
+		{
+			nbytes = pread(fdesc, (char *)arrow_file_head_image + offset,
+						   arrow_file_head_length - offset, offset);
+			if (nbytes < 0)
+			{
+				if (errno == EINTR)
+					continue;
+				Elog("failed on pread('%s'): %m", path);
+			}
+			else if (nbytes == 0)
+				Elog("unexpected EOF at pread('%s')", path);
+			offset += nbytes;
+		}
+	}
+	return outfd;
+}
+
+/*
+ * arrowChunkWriteOut
+ */
+static void
+arrowChunkWriteOut(arrowChunkBuffer *chunk)
+{
+
+}
+
+/*
+ * __execCaptureOnePacket
+ */
+static inline void
+__execCaptureOnePacket(arrowChunkBuffer *chunk,
+					   struct pfring_pkthdr *hdr, u_char *pos)
+{
+	u_char	   *end = pos + hdr->caplen;
+	u_char	   *next;
+	uint16_t	ether_type;
+	uint8_t		proto;
+
+	pos = handlePacketRawEthernet(chunk, hdr, pos, &ether_type);
+	if (!pos)
+		goto fillup_by_null;
+
+	if (ether_type == 0x0800)		/* IPv4 */
+	{
+		if ((protocol_mask & __PCAP_PROTO__IPv4) == 0)
+			goto fillup_by_null;
+
+		next = handlePacketIPv4Header(chunk, pos, end - pos, &proto);
+		if (!next)
+			goto fillup_by_null;
+		pos = next;
+		if ((protocol_mask & __PCAP_PROTO__IPv6) != 0)
+			handlePacketIPv6Header(chunk, NULL, 0, NULL);
+	}
+	else if (ether_type == 0x86dd)	/* IPv6 */
+	{
+		if ((protocol_mask & __PCAP_PROTO__IPv6) == 0)
+			goto fillup_by_null;
+		next = handlePacketIPv6Header(chunk, pos, end - pos, &proto);
+		if (!next)
+			goto fillup_by_null;
+		pos = next;
+		if ((protocol_mask & __PCAP_PROTO__IPv4) != 0)
+			handlePacketIPv4Header(chunk, NULL, 0, NULL);
+	}
+	else
+	{
+		/* neither IPv4 nor IPv6 */
+		goto fillup_by_null;
+	}
+
+	/* TCP */
+	if (proto == 0x06 && (protocol_mask & __PCAP_PROTO__TCP) != 0)
+	{
+		next = handlePacketTcpHeader(chunk, pos, end - pos, proto);
+		if (!next)
+			handlePacketTcpHeader(chunk, NULL, 0, -1);
+		pos = next;
+	}
+	else
+	{
+		handlePacketTcpHeader(chunk, NULL, 0, proto);
+	}
+
+	/* UDP */
+	if (proto == 0x11 && (protocol_mask & __PCAP_PROTO__UDP) != 0)
+	{
+		next = handlePacketUdpHeader(chunk, pos, end - pos, proto);
+		if (!next)
+			handlePacketUdpHeader(chunk, NULL, 0, 0xff);
+		pos = next;
+	}
+	else
+	{
+		handlePacketUdpHeader(chunk, NULL, 0, proto);
+	}
+
+	/* ICMP */
+	if (proto == 0x01 && (protocol_mask & __PCAP_PROTO__ICMP) != 0)
+	{
+		next = handlePacketIcmpHeader(chunk, pos, end - pos, proto);
+		if (!next)
+			handlePacketIcmpHeader(chunk, NULL, 0, 0xff);
+		pos = next;
+	}
+	else
+	{
+		handlePacketIcmpHeader(chunk, NULL, 0, proto);
+	}
+
+	/* Payload */
+	if (!only_headers)
+		handlePacketPayload(chunk, pos, end - pos);
+	return;
+
+fillup_by_null:
+	if ((protocol_mask & __PCAP_PROTO__IPv4) != 0)
+		handlePacketIPv4Header(chunk, NULL, 0, NULL);
+	if ((protocol_mask & __PCAP_PROTO__IPv6) != 0)
+		handlePacketIPv6Header(chunk, NULL, 0, NULL);
+	if ((protocol_mask & __PCAP_PROTO__TCP) != 0)
+		handlePacketTcpHeader(chunk, NULL, 0, 0xff);
+	if ((protocol_mask & __PCAP_PROTO__UDP) != 0)
+		handlePacketUdpHeader(chunk, NULL, 0, 0xff);
+	if ((protocol_mask & __PCAP_PROTO__ICMP) != 0)
+		handlePacketIcmpHeader(chunk, NULL, 0, 0xff);
+	if (!only_headers && pos != NULL)
+		handlePacketPayload(chunk, pos, end - pos);
 }
 
 /*
@@ -1022,114 +1252,27 @@ execCapturePackets(arrowChunkBuffer *chunk)
 {
 	struct pfring_pkthdr hdr;
 	u_char		__buffer[10000];
+	u_char	   *buffer = __buffer;
+	int			j, rv;
+
+	/* clear the chunk-buffer */
+	for (j=0; j < chunk->nfields; j++)
+		sql_field_clear(&chunk->columns[j]);
+	chunk->usage = 0;
+	chunk->nitems = 0;
 
 	while (!do_shutdown)
 	{
-		u_char	   *pos = __buffer;
-		int			rv;
-
-		rv = pfring_recv(pd, &pos, sizeof(__buffer), &hdr, 1);
+		rv = pfring_recv(pd, &buffer, sizeof(__buffer), &hdr, 1);
 		if (rv > 0)
 		{
-			u_char	   *end = pos + hdr.caplen;
-			u_char	   *next;
-			uint16_t	ether_type;
-			uint8_t		proto;
-
-			pos = handlePacketRawEthernet(chunk, &hdr, pos, &ether_type);
-			if (!pos)
-				goto fillup_by_null;
-
-			if (ether_type == 0x0800)		/* IPv4 */
-			{
-				if ((protocol_mask & __PCAP_PROTO__IPv4) == 0)
-					goto fillup_by_null;
-
-				next = handlePacketIPv4Header(chunk, pos, end - pos, &proto);
-				if (!next)
-					goto fillup_by_null;
-				pos = next;
-				if ((protocol_mask & __PCAP_PROTO__IPv6) != 0)
-					handlePacketIPv6Header(chunk, NULL, 0, NULL);
-			}
-			else if (ether_type == 0x86dd)	/* IPv6 */
-			{
-				if ((protocol_mask & __PCAP_PROTO__IPv6) == 0)
-					goto fillup_by_null;
-				next = handlePacketIPv6Header(chunk, pos, end - pos, &proto);
-				if (!next)
-					goto fillup_by_null;
-				pos = next;
-				if ((protocol_mask & __PCAP_PROTO__IPv4) != 0)
-					handlePacketIPv4Header(chunk, NULL, 0, NULL);
-			}
-			else
-			{
-				/* neither IPv4 nor IPv6 */
-				goto fillup_by_null;
-			}
-
-			if (proto == 0x06 &&		/* TCP */
-				(protocol_mask & __PCAP_PROTO__TCP) != 0)
-			{
-				next = handlePacketTcpHeader(chunk, pos, end - pos, proto);
-				if (!next)
-					handlePacketTcpHeader(chunk, NULL, 0, -1);
-				pos = next;
-			}
-			else
-			{
-				handlePacketTcpHeader(chunk, NULL, 0, proto);
-			}
-
-			if (proto == 0x11 &&		/* UDP */
-				(protocol_mask & __PCAP_PROTO__UDP) != 0)
-			{
-				next = handlePacketUdpHeader(chunk, pos, end - pos, proto);
-				if (!next)
-					handlePacketUdpHeader(chunk, NULL, 0, 0xff);
-				pos = next;
-			}
-			else
-			{
-				handlePacketUdpHeader(chunk, NULL, 0, proto);
-			}
-
-			if (proto == 0x01 &&		/* ICMP */
-				(protocol_mask & __PCAP_PROTO__ICMP) != 0)
-			{
-				next = handlePacketIcmpHeader(chunk, pos, end - pos, proto);
-				if (!next)
-					handlePacketIcmpHeader(chunk, NULL, 0, 0xff);
-				pos = next;
-			}
-			else
-			{
-				handlePacketIcmpHeader(chunk, NULL, 0, proto);
-			}
-
-			/* Payload */
-			if (!only_headers)
-				handlePacketPayload(chunk, pos, end - pos);
-			continue;
-
-		fillup_by_null:
-			if ((protocol_mask & __PCAP_PROTO__IPv4) != 0)
-				handlePacketIPv4Header(chunk, NULL, 0, NULL);
-			if ((protocol_mask & __PCAP_PROTO__IPv6) != 0)
-				handlePacketIPv6Header(chunk, NULL, 0, NULL);
-			if ((protocol_mask & __PCAP_PROTO__TCP) != 0)
-				handlePacketTcpHeader(chunk, NULL, 0, 0xff);
-			if ((protocol_mask & __PCAP_PROTO__UDP) != 0)
-				handlePacketUdpHeader(chunk, NULL, 0, 0xff);
-			if ((protocol_mask & __PCAP_PROTO__ICMP) != 0)
-				handlePacketIcmpHeader(chunk, NULL, 0, 0xff);
-			if (!only_headers && pos != NULL)
-				handlePacketPayload(chunk, pos, end - pos);
+			__execCaptureOnePacket(chunk, &hdr, buffer);
+			if (chunk->usage >= record_batch_threshold)
+				return 1;	/* write out the buffer */
 		}
 	}
-	//flush pending packets
-	return -1;
+	/* interrupted, thus chunk-buffer is partially filled up */
+	return 0;
 }
 
 /*
@@ -1138,14 +1281,19 @@ execCapturePackets(arrowChunkBuffer *chunk)
 static void *
 pcap_worker_main(void *__arg)
 {
-	arrowChunkBuffer *chunk = NULL;
+	arrowChunkBuffer *chunk;
 
+	/* assign worker-id of this thread */
 	worker_id = (long)__arg;
+
+	/* allocation of local chunk buffer */
+	chunk = palloc0(offsetof(arrowChunkBuffer,
+							 columns[PCAP_SCHEMA_MAX_NFIELDS]));
+	chunk->nfields = arrowSchemaInitFields(chunk->columns);
 
 	while (!do_shutdown)
 	{
-		arrowFileDesc *afd;
-		int		status;
+		int		status = -1;
 
 		if (sem_wait(&pcap_worker_sem) != 0)
 		{
@@ -1153,69 +1301,39 @@ pcap_worker_main(void *__arg)
 				continue;
 			Elog("worker-%d: failed on sem_wait: %m", worker_id);
 		}
-		if (do_shutdown)
-			break;		/* bailout */
-
-		/* fetch, or allocate a local buffer */
-		pthreadMutexLock(&arrow_file_desc_lock);
-		chunk = arrow_chunk_buffer_freelist;
-		if (chunk)
-		{
-			arrow_chunk_buffer_freelist = chunk->next;
-			chunk->next = NULL;
-		}
-		else
-		{
-			chunk = palloc0(offsetof(arrowChunkBuffer,
-									 columns[PCAP_SCHEMA_MAX_NFIELDS]));
-			chunk->nfields = arrowSchemaInitFields(chunk->columns);
-		}
-		arrow_file_desc_current->refcnt++;
-		chunk->afd = arrow_file_desc_current;
-		pthreadMutexUnlock(&arrow_file_desc_lock);
-
-		/* Ok, go to packet capture */
-		status = execCapturePackets(chunk);
-		if (sem_post(&pcap_worker_sem) != 0)
-			Elog("failed on sem_post: %m");
 		/*
-		 * arrowChunkBuffer exceeds the threshold to flush, so this thread
-		 * release semaphore, then write out a record-batch.
+		 * Ok, Go to packet capture
 		 */
+		if (!do_shutdown)
+		{
+			status = execCapturePackets(chunk);
+			Assert(status >= 0);
+		}
+		if (sem_post(&pcap_worker_sem) != 0)
+            Elog("failed on sem_post: %m");
+
 		if (status > 0)
 		{
-			//write out chunk here
+			/*
+			 * chunk-buffer consumption exceeds record-batch-threshold
+			 * so, write out by itself.
+			 */
+			arrowChunkWriteOut(chunk);
 		}
-
-		/*
-		 * Switch chunk-buffer, if output file is switched. Elsewhere
-		 */
-		pthreadMutexLock(&arrow_file_desc_lock);
-		afd = chunk->afd;
-		if (afd != arrow_file_desc_current)
+		else if (status == 0)
 		{
-			chunk->next = afd->pending;
-			afd->pending = chunk;
-		}
-		else
-		{
-			chunk->next = arrow_chunk_buffer_freelist;
-			arrow_chunk_buffer_freelist = chunk;
-		}
-		if (--afd->refcnt == 0)
-		{
-			if (pthread_cond_broadcast(&arrow_file_desc_cond) != 0)
-				Elog("failed on pthread_cond_broadcast");
-		}
-		pthreadMutexUnlock(&arrow_file_desc_lock);
-		chunk = NULL;
-	}
-	//chain chunk to the pending-list
-	if (chunk)
-	{
+			/*
+			 * execCapturePackets() was interrupted by do_shutdown.
+			 * so, final chunk shall be merged by the main thread.
+			 */
+			Assert(do_shutdown);
+			pthreadMutexLock(&arrow_file_desc_lock);
+			chunk->next = arrow_chunk_buffer_pending;
+			arrow_chunk_buffer_pending = chunk;
+			pthreadMutexUnlock(&arrow_file_desc_lock);
 
-
-
+			break;
+		}
 	}
 	return NULL;
 }
@@ -1249,8 +1367,6 @@ usage(int status)
 		  "        (default: 'tcp4,udp4,icmp4,ipv4')\n"
 		  "  -t|--threads=<NUM of threads> (default: 2 * NCPUs)\n"
 		  "     --pcap-threads=<NUM of threads> (default: NCPUS)\n"
-		  "  -d|--duration=<DURATION> : duration until output switch\n"
-		  "      <DURATION> is one of: minute, hour, day, weeek, month\n"
 		  "  -l|--limit=<LIMIT> : (default: no limit)\n"
 		  "  -s|--chunk-size=<SIZE> : size of record batch (default: 128MB)\n"
 		  "  -r|--rule=<RULE> : packet filtering rules\n"
@@ -1270,7 +1386,6 @@ parse_options(int argc, char *argv[])
 		{"output",       required_argument, NULL, 'o'},
 		{"protocol",     required_argument, NULL, 'p'},
 		{"threads",      required_argument, NULL, 't'},
-		{"duration",     required_argument, NULL, 'd'},
 		{"limit",        required_argument, NULL, 'l'},
 		{"chunk-size",   required_argument, NULL, 's'},
 		{"rule",         required_argument, NULL, 'r'},
@@ -1284,7 +1399,7 @@ parse_options(int argc, char *argv[])
 	bool	output_has_seqno = false;
 	char   *pos;
 
-	while ((code = getopt_long(argc, argv, "i:o:p:t:d:l:s:r:h",
+	while ((code = getopt_long(argc, argv, "i:o:p:t:l:s:r:h",
 							   long_options, NULL)) >= 0)
 	{
 		char	   *token, *end;
@@ -1344,21 +1459,6 @@ parse_options(int argc, char *argv[])
 					Elog("invalid --pcap-threads argument: %s", optarg);
 				if (num_pcap_threads < 1)
 					Elog("invalid number of pcap-threads: %d", num_pcap_threads);
-				break;
-
-			case 'd':	/* duration */
-				if (strcmp(optarg, "minute") == 0)
-					output_switch_interval = PCAP_SWITCH__PER_MINUTE;
-				else if (strcmp(optarg, "hour") == 0)
-					output_switch_interval = PCAP_SWITCH__PER_MINUTE;
-				else if (strcmp(optarg, "day") == 0)
-					output_switch_interval = PCAP_SWITCH__PER_MINUTE;
-				else if (strcmp(optarg, "week") == 0)
-					output_switch_interval = PCAP_SWITCH__PER_MINUTE;
-				else if (strcmp(optarg, "month") == 0)
-					output_switch_interval = PCAP_SWITCH__PER_MINUTE;
-				else
-					Elog("unknown interval unit (%s) at -d|--duration option", optarg);
 				break;
 
 			case 'l':	/* limit */
@@ -1439,97 +1539,6 @@ parse_options(int argc, char *argv[])
 		num_pcap_threads = NCPUS;
 }
 
-/*
- * arrowOpenOutputFile
- */
-static arrowFileDesc *
-arrowOpenOutputFile(void)
-{
-	static int	output_file_seqno = 1;
-	time_t		t = time(NULL);
-	struct tm	tm;
-	char	   *path, *pos;
-	int			off, sz = 256;
-	int			fdesc, flags;
-	arrowFileDesc *afd;
-
-	/* build file-name */
-	localtime_r(&t, &tm);
-	do {
-		off = 0;
-		path = alloca(sz);
-
-		for (pos = output_filename; *pos != '\0' && off < sz; pos++)
-		{
-			if (*pos == '%')
-			{
-				pos++;
-				switch (*pos)
-				{
-					case 'i':
-						off += snprintf(path+off, sz-off, "%s", input_pathname);
-						break;
-					case 'Y':
-						off += snprintf(path+off, sz-off, "%04d", tm.tm_year + 1900);
-						break;
-					case 'y':
-						off += snprintf(path+off, sz-off, "%02d", tm.tm_year % 100);
-						break;
-					case 'm':
-						off += snprintf(path+off, sz-off, "%02d", tm.tm_mon + 1);
-						break;
-					case 'd':
-						off += snprintf(path+off, sz-off, "%02d", tm.tm_mday);
-						break;
-					case 'H':
-						off += snprintf(path+off, sz-off, "%02d", tm.tm_hour);
-						break;
-					case 'M':
-						off += snprintf(path+off, sz-off, "%02d", tm.tm_min);
-						break;
-					case 'S':
-						off += snprintf(path+off, sz-off, "%02d", tm.tm_sec);
-						break;
-					case 'q':
-						off += snprintf(path+off, sz-off, "%d", output_file_seqno);
-					break;
-					default:
-						Elog("unexpected output file format '%%%c'", *pos);
-				}
-			}
-			else
-			{
-				path[off++] = *pos;
-			}
-		}
-		if (off < sz)
-			path[off++] = '\0';
-	} while (off >= sz);
-
-	/* open file */
-	flags = O_RDWR | O_CREAT | O_EXCL;
-	if (enable_direct_io)
-		flags |= O_DIRECT;
-	fdesc = open(path, flags);
-	if (fdesc < 0)
-		Elog("failed to open('%s'): %m", path);
-
-	/* setup arrowFileDesc */
-	afd = palloc0(offsetof(arrowFileDesc,
-						   table.columns[PCAP_SCHEMA_MAX_NFIELDS]));
-	afd->refcnt = 0;
-	afd->seqno = output_file_seqno++;
-	pthreadMutexInit(&afd->mutex);
-	afd->pending = NULL;
-	afd->table.filename = pstrdup(path);
-	afd->table.fdesc = fdesc;
-	afd->table.f_pos = 0;
-	afd->table.segment_sz = record_batch_threshold;
-	afd->table.nfields = arrowSchemaInitFields(afd->table.columns);
-
-	return afd;
-}
-
 int main(int argc, char *argv[])
 {
 	struct stat	stat_buf;
@@ -1596,21 +1605,8 @@ int main(int argc, char *argv[])
 	/* open the output file, and misc init stuff */
 	arrow_file_desc_current = arrowOpenOutputFile();
 	pthreadMutexInit(&arrow_file_desc_lock);
-	pthreadCondInit(&arrow_file_desc_cond);
 	if (sem_init(&pcap_worker_sem, 0, num_pcap_threads) != 0)
 		Elog("failed on sem_init: %m");
-	/* preallocate chunk-buffer */
-	for (i=0; i < num_threads; i++)
-	{
-		arrowChunkBuffer *chunk;
-
-		chunk = palloc0(offsetof(arrowChunkBuffer,
-								 columns[PCAP_SCHEMA_MAX_NFIELDS]));
-		chunk->nfields = arrowSchemaInitFields(chunk->columns);
-
-		chunk->next = arrow_chunk_buffer_freelist;
-		arrow_chunk_buffer_freelist = chunk;
-	}
 
 	/* ctrl-c handler */
 	signal(SIGINT, on_sigint_handler);
@@ -1624,7 +1620,6 @@ int main(int argc, char *argv[])
 		if (rv != 0)
 			Elog("failed on pthread_create: %s", strerror(rv));
 	}
-
 	/* wait for completion */
 	for (i=0; i < num_threads; i++)
 	{
@@ -1633,7 +1628,7 @@ int main(int argc, char *argv[])
 			Elog("failed on pthread_join: %s", strerror(rv));
 	}
 
-	//write out arrow footer
+	/* wait for write out footers for any remaining */
 
 	return 0;
 }
