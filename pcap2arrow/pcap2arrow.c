@@ -1121,26 +1121,6 @@ arrowCloseOutputFile(arrowFileDesc *outfd)
 }
 
 /*
- * __appendRecordBatch
- */
-static void
-__appendRecordBatch(SQLtable *table, ArrowBlock *block)
-{
-	ArrowBlock *dest;
-	size_t		sz;
-
-	if (!table->recordBatches)
-		table->recordBatches = palloc0(sizeof(ArrowBlock) * 40);
-	else
-	{
-		sz = sizeof(ArrowBlock) * (table->numRecordBatches + 1);
-		table->recordBatches = repalloc(table->recordBatches, sz);
-	}
-	dest = &table->recordBatches[table->numRecordBatches++];
-	memcpy(dest, block, sizeof(ArrowBlock));
-}
-
-/*
  * arrowChunkWriteOut
  */
 static void
@@ -1148,21 +1128,16 @@ arrowChunkWriteOut(SQLtable *chunk)
 {
 	arrowFileDesc *outfd = NULL;
 	ArrowBlock	block;
-	off_t		base;
+	size_t		meta_sz;
 	size_t		length;
-	int			index;
 	bool		close_file = false;
 
 	/*
 	 * writeArrowXXXX() routines setup iov array if table->fdesc < 0.
 	 */
 	Assert(chunk->fdesc < 0);
-	Assert(chunk->numRecordBatches == 0);
-	Assert(chunk->iov_cnt == 0);
-	index = writeArrowRecordBatch(chunk);
-	memcpy(&block, &chunk->recordBatches[index], sizeof(ArrowBlock));
-	length = block.metaDataLength + block.bodyLength;
-
+	length = setupArrowRecordBatchIOV(chunk);
+	
 	/*
 	 * attach file descriptor
 	 */
@@ -1170,13 +1145,12 @@ arrowChunkWriteOut(SQLtable *chunk)
 	for (;;)
 	{
 		outfd = arrow_file_desc_current;
-		base = outfd->table.f_pos;
-		if (base < output_filesize_limit)
+		if (outfd->table.f_pos < output_filesize_limit)
 		{
 			/* Ok, [base ... base + usage) is reserved */
 			chunk->fdesc    = outfd->table.fdesc;
 			chunk->filename = outfd->table.filename;
-			chunk->f_pos    = block.offset = base;
+			chunk->f_pos    = outfd->table.f_pos;
 
 			outfd->table.f_pos += length;
 			outfd->refcnt++;
@@ -1197,45 +1171,32 @@ arrowChunkWriteOut(SQLtable *chunk)
 	}
 	pthreadMutexUnlock(&arrow_file_desc_lock);
 
-	/* Ok, write out */
-	index = 0;
-	while (index < chunk->iov_cnt)
-	{
-		ssize_t	nbytes;
+	/* ok, write out record batch (see writeArrowRecordBatch) */
+	Assert(chunk->__iov_cnt > 0 &&
+		   chunk->__iov[0].iov_len <= length);
+	meta_sz = chunk->__iov[0].iov_len;
 
-		nbytes = pwritev(chunk->fdesc,
-						 chunk->iov + index,
-						 chunk->iov_cnt - index,
-						 base);
-		if (nbytes < 0)
-		{
-			if (errno == EINTR)
-				continue;
-			Elog("failed on pwritev('%s'): %m", chunk->filename);
-		}
-		else if (nbytes == 0)
-			Elog("unexpected EOF at pwritev('%s'): %m", chunk->filename);
+	memset(&block, 0, sizeof(ArrowBlock));
+	initArrowNode(&block, Block);
+	block.offset = chunk->f_pos;
+	block.metaDataLength = meta_sz;
+	block.bodyLength = length - meta_sz;
 
-		base += nbytes;
-		while (index < chunk->iov_cnt &&
-			   nbytes >= chunk->iov[index].iov_len)
-		{
-			nbytes -= chunk->iov[index++].iov_len;
-		}
+	arrowFileWriteIOV(chunk);
 
-		Assert(index < chunk->iov_cnt ||
-			   (index == chunk->iov_cnt && nbytes == 0));
-		if (nbytes > 0)
-		{
-			chunk->iov[index].iov_len -= nbytes;
-			chunk->iov[index].iov_base =
-				((char *)chunk->iov[index].iov_base + nbytes);
-		}
-	}
-
-	/* Detach */
+	/*
+	 * Ok, append ArrowBlock and detach file descriptor
+	 */
 	pthreadMutexLock(&arrow_file_desc_lock);
-	__appendRecordBatch(&outfd->table, &block);
+	if (!outfd->table.recordBatches)
+		outfd->table.recordBatches = palloc0(sizeof(ArrowBlock) * 40);
+	else
+	{
+		length = sizeof(ArrowBlock) * (outfd->table.numRecordBatches + 1);
+		outfd->table.recordBatches = repalloc(outfd->table.recordBatches, length);
+	}
+	outfd->table.recordBatches[outfd->table.numRecordBatches++] = block;
+
 	Assert(outfd->refcnt > 0);
 	if (--outfd->refcnt == 0 && arrow_file_desc_current != outfd)
 		close_file = true;
@@ -1247,8 +1208,6 @@ arrowChunkWriteOut(SQLtable *chunk)
 	chunk->fdesc = -1;
 	chunk->filename = NULL;
 	chunk->f_pos = 0;
-	chunk->iov_cnt = 0;
-	chunk->numRecordBatches = 0;
 }
 
 /*
