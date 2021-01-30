@@ -52,27 +52,15 @@
 #define PCAP_SWITCH__PER_WEEK		4
 #define PCAP_SWITCH__PER_MONTH		5
 
-typedef struct arrowFileDesc		arrowFileDesc;
-typedef struct arrowChunkBuffer		arrowChunkBuffer;
-
-#define PCAP_SCHEMA_MAX_NFIELDS		50
 /*
  * arrowFileDesc
  */
-struct arrowFileDesc
+typedef struct
 {
 	int				refcnt;
 	SQLtable		table;
-};
-
-/*
- * arrowChunkBuffer
- */
-struct arrowChunkBuffer
-{
-	size_t			usage;
-	SQLtable		table;
-};
+} arrowFileDesc;
+#define PCAP_SCHEMA_MAX_NFIELDS		50
 
 /*
  * misc definitions
@@ -98,7 +86,7 @@ static pfring		   *pd = NULL;
 static volatile bool	do_shutdown = false;
 static pthread_mutex_t	arrow_file_desc_lock;
 static arrowFileDesc   *arrow_file_desc_current = NULL;
-static arrowChunkBuffer **arrow_chunk_buffer_array;
+static SQLtable		  **arrow_chunks_array;
 static sem_t			pcap_worker_sem;
 
 /* static variables for PCAP file scan mode */
@@ -465,6 +453,7 @@ arrowFieldInitAsUint8(SQLtable *table, int cindex, const char *field_name)
 	column->put_value = put_uint8_value;
 	column->field_name = pstrdup(field_name);
 
+	table->numFieldNodes++;
 	table->numBuffers += 2;
 }
 
@@ -480,6 +469,7 @@ arrowFieldInitAsUint16(SQLtable *table, int cindex, const char *field_name)
 	column->put_value = put_uint16_value;
 	column->field_name = pstrdup(field_name);
 
+	table->numFieldNodes++;
 	table->numBuffers += 2;
 }
 
@@ -495,6 +485,7 @@ arrowFieldInitAsUint16Bswap(SQLtable *table, int cindex, const char *field_name)
 	column->put_value = put_uint16_value_bswap;
 	column->field_name = pstrdup(field_name);
 
+	table->numFieldNodes++;
 	table->numBuffers += 2;
 }
 
@@ -511,6 +502,7 @@ arrowFieldInitAsUint32(SQLtable *table, int cindex, const char *field_name)
 	column->put_value = put_uint32_value;
 	column->field_name = pstrdup(field_name);
 
+	table->numFieldNodes++;
 	table->numBuffers += 2;
 }
 #endif
@@ -527,6 +519,7 @@ arrowFieldInitAsUint32Bswap(SQLtable *table, int cindex, const char *field_name)
 	column->put_value = put_uint32_value_bswap;
 	column->field_name = pstrdup(field_name);
 
+	table->numFieldNodes++;
 	table->numBuffers += 2;
 }
 
@@ -542,6 +535,7 @@ arrowFieldInitAsTimestampUs(SQLtable *table, int cindex, const char *field_name)
 	column->put_value = put_timestamp_us_value;
 	column->field_name = pstrdup(field_name);
 
+	table->numFieldNodes++;
 	table->numBuffers += 2;
 }
 
@@ -557,6 +551,7 @@ arrowFieldInitAsMacAddr(SQLtable *table, int cindex, const char *field_name)
 	column->field_name = pstrdup(field_name);
 	arrowFieldAddCustomMetadata(column, "pg_type", "pg_catalog.macaddr");
 
+	table->numFieldNodes++;
 	table->numBuffers += 2;
 }
 
@@ -572,6 +567,7 @@ arrowFieldInitAsIP4Addr(SQLtable *table, int cindex, const char *field_name)
 	column->field_name = pstrdup(field_name);
 	arrowFieldAddCustomMetadata(column, "pg_type", "pg_catalog.inet");
 
+	table->numFieldNodes++;
 	table->numBuffers += 2;
 }
 
@@ -587,6 +583,7 @@ arrowFieldInitAsIP6Addr(SQLtable *table, int cindex, const char *field_name)
 	column->field_name = pstrdup(field_name);
 	arrowFieldAddCustomMetadata(column, "pg_type", "pg_catalog.inet");
 
+	table->numFieldNodes++;
 	table->numBuffers += 2;
 }
 
@@ -600,61 +597,9 @@ arrowFieldInitAsBinary(SQLtable *table, int cindex, const char *field_name)
 	column->put_value = put_variable_value;
 	column->field_name = pstrdup(field_name);
 
+	table->numFieldNodes++;
 	table->numBuffers += 3;
 }
-
-#if 0
-/* IPv6 Routing Ext Header */
-static size_t
-put_ipv6ext_routing_value(SQLfield *column, const char *addr, int sz)
-{
-}
-
-static void
-arrowFieldInitAsIPv6Ext_Routing(SQLtable *table, int cindex, const char *field_name)
-{
-	SQLfield   *subfields = palloc0(sizeof(SQLfield) * 3);
-
-	memset(column, 0, sizeof(SQLfield));
-	initArrowNode(&column->arrow_type, Struct);
-	column->put_value = put_ipv6ext_routing_value;
-
-	arrowFieldInitAsUint8(&subfields[0], "routing_type");
-	arrowFieldInitAsUint8(&subfields[1], "segment_left");
-	arrowFieldInitAsBinary(&subfields[2], "data");
-	column->subfields = subfields;
-	column->nfields = 3;
-}
-
-/* IPv6 Fragment Ext Header */
-static size_t
-put_ipv6ext_fragment_value(SQLtable *table, int cindex, const char *addr, int sz)
-{}
-
-static void
-arrowFieldInitAsIPv6Ext_Fragment(SQLfield *column, const char *field_name)
-{
-	SQLfield   *subfields = palloc0(sizeof(SQLfield) * 3);
-
-	memset(column, 0, sizeof(SQLfield));
-	initArrowNode(&column->arrow_type, Struct);
-	column->put_value = put_ipv6ext_fragment_value;
-
-	arrowFieldInitAsUint16(&subfields[0], "fragment_offset");
-	arrowFieldInitAsBool(&subfields[1], "m_flag");
-	arrowFieldInitAsUint32(&subfields[2], "identification");
-	column->subfields = subfields;
-	column->nfields = 3;
-}
-
-static void
-arrowFieldInitAsIPv6Ext_AH(SQLtable *table, int cindex, const char *field_name)
-{}
-
-static void
-arrowFieldInitAsIPv6Ext_ESP(SQLtable *table, int cindex, const char *field_name)
-{}
-#endif
 
 /* basic ethernet frame */
 static int arrow_cindex__timestamp			= -1;
@@ -765,8 +710,7 @@ arrowPcapSchemaInit(SQLtable *table)
 	/* remained data - payload */
 	__ARROW_FIELD_INIT(payload,		Binary);
 #undef __ARROW_FIELD_INIT
-	table->nfields = j;		//duplicated?
-	table->numFieldNodes = j;
+	table->nfields = j;
 
 	return j;
 }
@@ -776,14 +720,14 @@ arrowPcapSchemaInit(SQLtable *table)
 	size_t      usage = 0
 #define __FIELD_PUT_VALUE(NAME,ADDR,SZ)									\
 	Assert(arrow_cindex__##NAME >= 0);									\
-	__field = &chunk->table.columns[arrow_cindex__##NAME];				\
+	__field = &chunk->columns[arrow_cindex__##NAME];				\
 	usage += __field->put_value(__field, (const char *)(ADDR),(SZ))
 
 /*
  * handlePacketRawEthernet
  */
 static u_char *
-handlePacketRawEthernet(arrowChunkBuffer *chunk,
+handlePacketRawEthernet(SQLtable *chunk,
 						struct pfring_pkthdr *hdr,
 						u_char *buf, uint16_t *p_ether_type)
 {
@@ -816,7 +760,7 @@ handlePacketRawEthernet(arrowChunkBuffer *chunk,
  * handlePacketIPv4Header
  */
 static u_char *
-handlePacketIPv4Header(arrowChunkBuffer *chunk,
+handlePacketIPv4Header(SQLtable *chunk,
 					   u_char *buf, size_t sz, uint8_t *p_proto)
 {
 	__FIELD_PUT_VALUE_DECL;
@@ -887,7 +831,7 @@ fillup_by_null:
  * handlePacketIPv6Header
  */
 static u_char *
-handlePacketIPv6Header(arrowChunkBuffer *chunk,
+handlePacketIPv6Header(SQLtable *chunk,
 					   u_char *buf, size_t sz, uint8_t *p_proto)
 {
 	Elog("handlePacketIPv6Header not implemented yet");
@@ -898,7 +842,7 @@ handlePacketIPv6Header(arrowChunkBuffer *chunk,
  * handlePacketTcpHeader
  */
 static u_char *
-handlePacketTcpHeader(arrowChunkBuffer *chunk,
+handlePacketTcpHeader(SQLtable *chunk,
 					  u_char *buf, size_t sz, int proto)
 {
 	__FIELD_PUT_VALUE_DECL;
@@ -962,7 +906,7 @@ fillup_by_null:
  * handlePacketUdpHeader
  */
 static u_char *
-handlePacketUdpHeader(arrowChunkBuffer *chunk,
+handlePacketUdpHeader(SQLtable *chunk,
 					  u_char *buf, size_t sz, int proto)
 {
 	__FIELD_PUT_VALUE_DECL;
@@ -999,7 +943,7 @@ fillup_by_null:
  * handlePacketIcmpHeader
  */
 static u_char *
-handlePacketIcmpHeader(arrowChunkBuffer *chunk,
+handlePacketIcmpHeader(SQLtable *chunk,
 					   u_char *buf, size_t sz, int proto)
 {
 	__FIELD_PUT_VALUE_DECL;
@@ -1030,7 +974,7 @@ fillup_by_null:
  * handlePacketPayload
  */
 static void
-handlePacketPayload(arrowChunkBuffer *chunk, u_char *buf, size_t sz)
+handlePacketPayload(SQLtable *chunk, u_char *buf, size_t sz)
 {
 	__FIELD_PUT_VALUE_DECL;
 	
@@ -1200,7 +1144,7 @@ __appendRecordBatch(SQLtable *table, ArrowBlock *block)
  * arrowChunkWriteOut
  */
 static void
-arrowChunkWriteOut(arrowChunkBuffer *chunk)
+arrowChunkWriteOut(SQLtable *chunk)
 {
 	arrowFileDesc *outfd = NULL;
 	ArrowBlock	block;
@@ -1212,11 +1156,11 @@ arrowChunkWriteOut(arrowChunkBuffer *chunk)
 	/*
 	 * writeArrowXXXX() routines setup iov array if table->fdesc < 0.
 	 */
-	Assert(chunk->table.fdesc < 0);
-	Assert(chunk->table.numRecordBatches == 0);
-	Assert(chunk->table.iov_cnt == 0);
-	index = writeArrowRecordBatch(&chunk->table);
-	memcpy(&block, &chunk->table.recordBatches[index], sizeof(ArrowBlock));
+	Assert(chunk->fdesc < 0);
+	Assert(chunk->numRecordBatches == 0);
+	Assert(chunk->iov_cnt == 0);
+	index = writeArrowRecordBatch(chunk);
+	memcpy(&block, &chunk->recordBatches[index], sizeof(ArrowBlock));
 	length = block.metaDataLength + block.bodyLength;
 
 	/*
@@ -1230,9 +1174,9 @@ arrowChunkWriteOut(arrowChunkBuffer *chunk)
 		if (base < output_filesize_limit)
 		{
 			/* Ok, [base ... base + usage) is reserved */
-			chunk->table.fdesc = outfd->table.fdesc;
-			chunk->table.filename = outfd->table.filename;
-			chunk->table.f_pos = block.offset = base;
+			chunk->fdesc    = outfd->table.fdesc;
+			chunk->filename = outfd->table.filename;
+			chunk->f_pos    = block.offset = base;
 
 			outfd->table.f_pos += length;
 			outfd->refcnt++;
@@ -1255,36 +1199,37 @@ arrowChunkWriteOut(arrowChunkBuffer *chunk)
 
 	/* Ok, write out */
 	index = 0;
-	while (index < chunk->table.iov_cnt)
+	while (index < chunk->iov_cnt)
 	{
 		ssize_t	nbytes;
 
-		nbytes = pwritev(chunk->table.fdesc,
-						 chunk->table.iov + index,
-						 chunk->table.iov_cnt - index,
+		nbytes = pwritev(chunk->fdesc,
+						 chunk->iov + index,
+						 chunk->iov_cnt - index,
 						 base);
 		if (nbytes < 0)
 		{
 			if (errno == EINTR)
 				continue;
-			Elog("failed on pwritev('%s'): %m", chunk->table.filename);
+			Elog("failed on pwritev('%s'): %m", chunk->filename);
 		}
 		else if (nbytes == 0)
-			Elog("unexpected EOF at pwritev('%s'): %m", chunk->table.filename);
+			Elog("unexpected EOF at pwritev('%s'): %m", chunk->filename);
 
-		while (index < chunk->table.iov_cnt &&
-			   nbytes >= chunk->table.iov[index].iov_len)
+		base += nbytes;
+		while (index < chunk->iov_cnt &&
+			   nbytes >= chunk->iov[index].iov_len)
 		{
-			nbytes -= chunk->table.iov[index++].iov_len;
+			nbytes -= chunk->iov[index++].iov_len;
 		}
 
-		Assert(index < chunk->table.iov_cnt ||
-			   (index == chunk->table.iov_cnt && nbytes == 0));
+		Assert(index < chunk->iov_cnt ||
+			   (index == chunk->iov_cnt && nbytes == 0));
 		if (nbytes > 0)
 		{
-			chunk->table.iov[index].iov_len -= nbytes;
-			chunk->table.iov[index].iov_base =
-				((char *)chunk->table.iov[index].iov_base + nbytes);
+			chunk->iov[index].iov_len -= nbytes;
+			chunk->iov[index].iov_base =
+				((char *)chunk->iov[index].iov_base + nbytes);
 		}
 	}
 
@@ -1299,18 +1244,18 @@ arrowChunkWriteOut(arrowChunkBuffer *chunk)
 		arrowCloseOutputFile(outfd);
 
 	/* reset chunk buffer */
-	chunk->table.fdesc = -1;
-	chunk->table.filename = NULL;
-	chunk->table.f_pos = 0;
-	chunk->table.iov_cnt = 0;
-	chunk->table.numRecordBatches = 0;
+	chunk->fdesc = -1;
+	chunk->filename = NULL;
+	chunk->f_pos = 0;
+	chunk->iov_cnt = 0;
+	chunk->numRecordBatches = 0;
 }
 
 /*
  * __execCaptureOnePacket
  */
 static inline void
-__execCaptureOnePacket(arrowChunkBuffer *chunk,
+__execCaptureOnePacket(SQLtable *chunk,
 					   struct pfring_pkthdr *hdr, u_char *pos)
 {
 	u_char	   *end = pos + hdr->caplen;
@@ -1393,7 +1338,7 @@ __execCaptureOnePacket(arrowChunkBuffer *chunk,
 	/* Payload */
 	if (!only_headers)
 		handlePacketPayload(chunk, pos, end - pos);
-	chunk->table.nitems++;
+	chunk->nitems++;
 	return;
 
 fillup_by_null:
@@ -1409,23 +1354,21 @@ fillup_by_null:
 		handlePacketIcmpHeader(chunk, NULL, 0, 0xff);
 	if (!only_headers && pos != NULL)
 		handlePacketPayload(chunk, pos, end - pos);
-	chunk->table.nitems++;
+	chunk->nitems++;
 }
 
 /*
  * execCapturePackets
  */
 static int
-execCapturePackets(arrowChunkBuffer *chunk)
+execCapturePackets(SQLtable *chunk)
 {
 	struct pfring_pkthdr hdr;
 	u_char		__buffer[65536];
 	u_char	   *buffer = __buffer;
 	int			rv;
 
-	/* clear the buffer */
-	sql_table_clear(&chunk->table);
-	chunk->usage = 0;
+	sql_table_clear(chunk);
 
 	while (!do_shutdown)
 	{
@@ -1447,11 +1390,11 @@ execCapturePackets(arrowChunkBuffer *chunk)
 static void *
 pcap_worker_main(void *__arg)
 {
-	arrowChunkBuffer *chunk;
+	SQLtable   *chunk;
 
 	/* assign worker-id of this thread */
 	worker_id = (long)__arg;
-	chunk = arrow_chunk_buffer_array[worker_id];
+	chunk = arrow_chunks_array[worker_id];
 
 	while (!do_shutdown)
 	{
@@ -1682,23 +1625,23 @@ parse_options(int argc, char *argv[])
  * arrowMergeChunkWriteOut
  */
 static inline void
-__arrowMergeChunkOneRow(arrowChunkBuffer *dchunk,
-						arrowChunkBuffer *schunk, size_t index)
+__arrowMergeChunkOneRow(SQLtable *dchunk,
+						SQLtable *schunk, size_t index)
 {
 	size_t		usage = 0;
 	int			j;
 
-	Assert(dchunk->table.nfields == schunk->table.nfields);
-	for (j=0; j < schunk->table.nfields; j++)
+	Assert(dchunk->nfields == schunk->nfields);
+	for (j=0; j < schunk->nfields; j++)
 	{
-		SQLfield   *dcolumn = &dchunk->table.columns[j];
-		SQLfield   *scolumn = &schunk->table.columns[j];
+		SQLfield   *dcolumn = &dchunk->columns[j];
+		SQLfield   *scolumn = &schunk->columns[j];
 		void	   *addr;
 		size_t		sz, off;
 		uint64_t	val;
 		struct timeval ts_buf;
 
-		Assert(schunk->table.nitems == scolumn->nitems);
+		Assert(schunk->nitems == scolumn->nitems);
 		if ((scolumn->nullmap.data[index>>3] & (1<<(index&7))) == 0)
 		{
 			usage += dcolumn->put_value(dcolumn, NULL, 0);
@@ -1743,18 +1686,18 @@ __arrowMergeChunkOneRow(arrowChunkBuffer *dchunk,
 		}
 		usage += dcolumn->put_value(dcolumn, addr, sz);
 	}
-	dchunk->table.nitems++;
+	dchunk->nitems++;
 	dchunk->usage = usage;
 }
 
 static void
-arrowMergeChunkWriteOut(arrowChunkBuffer *dchunk,
-						arrowChunkBuffer *schunk,
+arrowMergeChunkWriteOut(SQLtable *dchunk,
+						SQLtable *schunk,
 						bool is_last_buddy)
 {
 	size_t		i;
 	
-	for (i=0; i < schunk->table.nitems; i++)
+	for (i=0; i < schunk->nitems; i++)
 	{
 		/* merge one row */
 		__arrowMergeChunkOneRow(dchunk, schunk, i);
@@ -1763,14 +1706,13 @@ arrowMergeChunkWriteOut(arrowChunkBuffer *dchunk,
 		if (dchunk->usage >= record_batch_threshold)
 		{
 			arrowChunkWriteOut(dchunk);
-			sql_table_clear(&dchunk->table);
-			dchunk->usage = 0;
+			sql_table_clear(dchunk);
 		}
 	}
 
 	if (is_last_buddy)
 	{
-		if (dchunk->table.nitems > 0)
+		if (dchunk->nitems > 0)
 			arrowChunkWriteOut(dchunk);
 		arrowCloseOutputFile(arrow_file_desc_current);
 	}
@@ -1789,16 +1731,16 @@ int main(int argc, char *argv[])
 	/* parse command line options */
 	parse_options(argc, argv);
 	/* chunk-buffer pre-allocation */
-	arrow_chunk_buffer_array = palloc0(sizeof(arrowChunkBuffer *) * (num_threads + 1));
-	for (i=0; i <= num_threads; i++)
+	arrow_chunks_array = palloc0(sizeof(SQLtable *) * num_threads);
+	for (i=0; i < num_threads; i++)
 	{
-		arrowChunkBuffer *chunk;
+		SQLtable   *chunk;
 
-		chunk = palloc0(offsetof(arrowChunkBuffer,
-								 table.columns[PCAP_SCHEMA_MAX_NFIELDS]));
-		chunk->table.nfields = arrowPcapSchemaInit(&chunk->table);
-		chunk->table.fdesc = -1;
-		arrow_chunk_buffer_array[i] = chunk;
+		chunk = palloc0(offsetof(SQLtable,
+								 columns[PCAP_SCHEMA_MAX_NFIELDS]));
+		arrowPcapSchemaInit(chunk);
+		chunk->fdesc = -1;
+		arrow_chunks_array[i] = chunk;
 	}
 	/* open the output file, and misc init stuff */
 	arrow_file_desc_current = arrowOpenOutputFile();
@@ -1878,8 +1820,8 @@ int main(int argc, char *argv[])
 	/* write out pending chunks */
 	for (i=1; i < num_threads; i++)
 	{
-		arrowMergeChunkWriteOut(arrow_chunk_buffer_array[0],
-								arrow_chunk_buffer_array[i],
+		arrowMergeChunkWriteOut(arrow_chunks_array[0],
+								arrow_chunks_array[i],
 								i == num_threads - 1);
 	}
 	return 0;
