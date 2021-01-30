@@ -537,7 +537,7 @@ arrowFieldInitAsTimestampUs(SQLtable *table, int cindex, const char *field_name)
 
 	memset(column, 0, sizeof(SQLfield));
 	initArrowNode(&column->arrow_type, Timestamp);
-	column->arrow_type.Timestamp.unit = ArrowTimeUnit__MilliSecond;
+	column->arrow_type.Timestamp.unit = ArrowTimeUnit__MicroSecond;
 	/* no timezone setting, right now */
 	column->put_value = put_timestamp_us_value;
 	column->field_name = pstrdup(field_name);
@@ -765,8 +765,9 @@ arrowPcapSchemaInit(SQLtable *table)
 	/* remained data - payload */
 	__ARROW_FIELD_INIT(payload,		Binary);
 #undef __ARROW_FIELD_INIT
+	table->nfields = j;		//duplicated?
 	table->numFieldNodes = j;
-	
+
 	return j;
 }
 
@@ -1708,7 +1709,7 @@ __arrowMergeChunkOneRow(arrowChunkBuffer *dchunk,
 		switch (scolumn->arrow_type.node.tag)
 		{
 			case ArrowNodeTag__Timestamp:
-				Assert(scolumn->arrow_type.Timestamp.unit == ArrowTimeUnit__MilliSecond);
+				Assert(scolumn->arrow_type.Timestamp.unit == ArrowTimeUnit__MicroSecond);
 				val = ((uint64_t *)scolumn->values.data)[index];
 				ts_buf.tv_sec = val / 1000000;
 				ts_buf.tv_usec = val % 1000000;
