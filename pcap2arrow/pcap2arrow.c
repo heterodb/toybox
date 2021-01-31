@@ -80,6 +80,7 @@ static size_t		output_filesize_limit = ULONG_MAX;			/* No Limit */
 static size_t		record_batch_threshold = (128UL << 20);		/* 128MB */
 static bool			enable_direct_io = false;
 static bool			only_headers = false;
+static int			print_stat_interval = -1;
 
 /* static variable for PF-RING capture mode */
 static pfring		   *pd = NULL;
@@ -107,6 +108,15 @@ typedef struct
 static pcapFileDesc	   *pcap_file_desc_array = NULL;
 static volatile int		pcap_file_desc_index = 0;
 static int				pcap_file_desc_nums = 0;
+
+/* capture statistics */
+static volatile uint64_t	stat_raw_packet_length = 0;
+static volatile uint64_t	stat_ip4_packet_count = 0;
+static volatile uint64_t	stat_ip6_packet_count = 0;
+static volatile uint64_t	stat_tcp_packet_count = 0;
+static volatile uint64_t	stat_udp_packet_count = 0;
+static volatile uint64_t	stat_icmp_packet_count = 0;
+static volatile uint64_t	stat_misc_packet_count = 0;
 
 /* other static variables */
 static long				PAGESIZE;
@@ -589,7 +599,7 @@ static int arrow_cindex__src_mac			= -1;
 static int arrow_cindex__ether_type			= -1;
 /* IPv4 headers */
 static int arrow_cindex__tos				= -1;
-static int arrow_cindex__length				= -1;
+static int arrow_cindex__ip_length			= -1;
 static int arrow_cindex__identifier			= -1;
 static int arrow_cindex__fragment			= -1;
 static int arrow_cindex__ttl				= -1;
@@ -641,7 +651,7 @@ arrowPcapSchemaInit(SQLtable *table)
 	if ((protocol_mask & __PCAP_PROTO__IPv4) != 0)
 	{
 		__ARROW_FIELD_INIT(tos,			Uint8);
-		__ARROW_FIELD_INIT(length,		Uint16Bswap);
+		__ARROW_FIELD_INIT(ip_length,	Uint16Bswap);
 		__ARROW_FIELD_INIT(identifier,	Uint16Bswap);
 		__ARROW_FIELD_INIT(fragment,	Uint16Bswap);
 		__ARROW_FIELD_INIT(ttl,			Uint8);
@@ -689,7 +699,10 @@ arrowPcapSchemaInit(SQLtable *table)
 		__ARROW_FIELD_INIT(icmp_checksum, Uint16Bswap);
 	}
 	/* remained data - payload */
-	__ARROW_FIELD_INIT(payload,		Binary);
+	if (!only_headers)
+	{
+		__ARROW_FIELD_INIT(payload,		  Binary);
+	}
 #undef __ARROW_FIELD_INIT
 	table->nfields = j;
 
@@ -748,7 +761,7 @@ handlePacketIPv4Header(SQLtable *chunk,
 	struct __ipv4_head {
 		uint8_t		version;	/* 4bit of version means header-size */
 		uint8_t		tos;
-		uint16_t	length;
+		uint16_t	ip_length;
 		uint16_t	identifier;
 		uint16_t	fragment;
 		uint8_t		ttl;
@@ -770,7 +783,7 @@ handlePacketIPv4Header(SQLtable *chunk,
 		goto fillup_by_null;
 
 	__FIELD_PUT_VALUE(tos,         &ipv4->tos,         sizeof(uint8_t));
-	__FIELD_PUT_VALUE(length,      &ipv4->length,      sizeof(uint16_t));
+	__FIELD_PUT_VALUE(ip_length,   &ipv4->ip_length,   sizeof(uint16_t));
 	__FIELD_PUT_VALUE(identifier,  &ipv4->identifier,  sizeof(uint16_t));
 	__FIELD_PUT_VALUE(fragment,    &ipv4->fragment,    sizeof(uint16_t));
 	__FIELD_PUT_VALUE(ttl,         &ipv4->ttl,         sizeof(uint8_t));
@@ -794,7 +807,7 @@ handlePacketIPv4Header(SQLtable *chunk,
 
 fillup_by_null:
 	__FIELD_PUT_VALUE(tos, NULL, 0);
-	__FIELD_PUT_VALUE(length, NULL, 0);
+	__FIELD_PUT_VALUE(ip_length, NULL, 0);
 	__FIELD_PUT_VALUE(identifier, NULL, 0);
 	__FIELD_PUT_VALUE(fragment, NULL, 0);
 	__FIELD_PUT_VALUE(ttl, NULL, 0);
@@ -908,9 +921,12 @@ handlePacketUdpHeader(SQLtable *chunk,
 	return buf + sizeof(struct __udp_head);
 
 fillup_by_null:
-	if (proto != 0x06)		/* if not TCP */
+	if (proto == 0x11)		/* only if UDP */
 	{
-		//???
+		/*
+		 * handlePacketTcpHeader() put values on src_port/dst_port
+		 * for other protocols.
+		 */
 		__FIELD_PUT_VALUE(src_port, NULL, 0);
 		__FIELD_PUT_VALUE(dst_port, NULL, 0);
 	}
@@ -1206,9 +1222,14 @@ __execCaptureOnePacket(SQLtable *chunk,
 	pos = handlePacketRawEthernet(chunk, hdr, pos, &ether_type);
 	if (!pos)
 		goto fillup_by_null;
+	if (print_stat_interval > 0)
+		atomicAdd64(&stat_raw_packet_length, hdr->len);
 
 	if (ether_type == 0x0800)		/* IPv4 */
 	{
+		if (print_stat_interval > 0)
+			atomicAdd64(&stat_ip4_packet_count, 1);
+
 		if ((protocol_mask & __PCAP_PROTO__IPv4) == 0)
 			goto fillup_by_null;
 
@@ -1221,6 +1242,9 @@ __execCaptureOnePacket(SQLtable *chunk,
 	}
 	else if (ether_type == 0x86dd)	/* IPv6 */
 	{
+		if (print_stat_interval > 0)
+			atomicAdd64(&stat_ip6_packet_count, 1);
+
 		if ((protocol_mask & __PCAP_PROTO__IPv6) == 0)
 			goto fillup_by_null;
 		next = handlePacketIPv6Header(chunk, pos, end - pos, &proto);
@@ -1239,6 +1263,9 @@ __execCaptureOnePacket(SQLtable *chunk,
 	/* TCP */
 	if (proto == 0x06 && (protocol_mask & __PCAP_PROTO__TCP) != 0)
 	{
+		if (print_stat_interval > 0)
+			atomicAdd64(&stat_tcp_packet_count, 1);
+
 		next = handlePacketTcpHeader(chunk, pos, end - pos, proto);
 		if (!next)
 			handlePacketTcpHeader(chunk, NULL, 0, -1);
@@ -1252,6 +1279,9 @@ __execCaptureOnePacket(SQLtable *chunk,
 	/* UDP */
 	if (proto == 0x11 && (protocol_mask & __PCAP_PROTO__UDP) != 0)
 	{
+		if (print_stat_interval > 0)
+			atomicAdd64(&stat_udp_packet_count, 1);
+
 		next = handlePacketUdpHeader(chunk, pos, end - pos, proto);
 		if (!next)
 			handlePacketUdpHeader(chunk, NULL, 0, 0xff);
@@ -1265,6 +1295,9 @@ __execCaptureOnePacket(SQLtable *chunk,
 	/* ICMP */
 	if (proto == 0x01 && (protocol_mask & __PCAP_PROTO__ICMP) != 0)
 	{
+		if (print_stat_interval > 0)
+			atomicAdd64(&stat_icmp_packet_count, 1);
+
 		next = handlePacketIcmpHeader(chunk, pos, end - pos, proto);
 		if (!next)
 			handlePacketIcmpHeader(chunk, NULL, 0, 0xff);
@@ -1372,36 +1405,39 @@ usage(int status)
 	fputs("usage: pcap2arrow [OPTIONS] [<pcap files>...]\n"
 		  "\n"
 		  "OPTIONS:\n"
-		  "  -i|--input=<input device>\n"
-		  "      if no input device is given, pcap2arrow tries to read\n"
-		  "      packets from the pcap files; either of them must be given.\n"
+		  "  -i|--input=DEVICE\n"
+		  "       specifies a network device to capture packet.\n"
 		  "  -o|--output=<output file; with format>\n"
-		  "      filename format can contains:"
-		  "        %i : interface name\n"
-		  "        %Y : year in 4-digits\n"
-		  "        %y : year in 2-digits\n"
-		  "        %m : month in 2-digits\n"
-		  "        %d : day in 2-digits\n"
-		  "        %H : hour in 2-digits\n"
-		  "        %M : minute in 2-digits\n"
-		  "        %S : second in 2-digits\n"
-		  "        %q : sequence number when file is switched by -l|--limit\n"
-		  "      default is '/tmp/pcap_%y%m%d_%H:%M:%S_%i_%i.arrow'\n"
+		  "       filename format can contains:"
+		  "         %i : interface name\n"
+		  "         %Y : year in 4-digits\n"
+		  "         %y : year in 2-digits\n"
+		  "         %m : month in 2-digits\n"
+		  "         %d : day in 2-digits\n"
+		  "         %H : hour in 2-digits\n"
+		  "         %M : minute in 2-digits\n"
+		  "         %S : second in 2-digits\n"
+		  "         %q : sequence number when file is switched by -l|--limit\n"
+		  "       default is '/tmp/pcap_%y%m%d_%H:%M:%S_%i_%i.arrow'\n"
 		  "  -p|--protocol=<PROTO>\n"
-		  "        <PROTO> is a comma separated string contains\n"
-		  "        the following tokens:\n"
-		  "          tcp4, udp4, icmp4, ipv4, tcp6, udp6, icmp6, ipv66\n"
-		  "        (default: 'tcp4,udp4,icmp4,ipv4')\n"
+		  "       <PROTO> is a comma separated string contains\n"
+		  "       the following tokens:\n"
+		  "         tcp4, udp4, icmp4, ipv4, tcp6, udp6, icmp6, ipv66\n"
+		  "       (default: 'tcp4,udp4,icmp4,ipv4')\n"
+		  "  -r|--rule=<RULE> : packet filtering rules\n"
+		  "       (default: none; valid only capturing mode)\n"
+		  "  -s|--stat[=INTERVAL]\n"
+		  "       enables to print statistics per INTERVAL\n"
 		  "  -t|--threads=<NUM of threads> (default: 2 * NCPUs)\n"
 		  "     --pcap-threads=<NUM of threads> (default: NCPUS)\n"
 		  "  -l|--limit=<LIMIT> : (default: no limit)\n"
-		  "  -s|--chunk-size=<SIZE> : size of record batch (default: 128MB)\n"
-		  "  -r|--rule=<RULE> : packet filtering rules\n"
+		  "     --only-headers: disables capture of payload\n"
+		  "     --chunk-size=<SIZE> : size of record batch (default: 128MB)\n"
 		  "     --direct-io : enables O_DIRECT for write-i/o\n"
 		  "  -h|--help    : shows this message\n"
 		  "\n"
-		  "  Copyright (C) 2020-2021 HeteroDB,Inc <contact@heterodb.com>\n",
-		  "  Copyright (C) 2020-2021 KaiGai Kohei <kaigai@kaigai.gr.jp>\n"
+		  "  Copyright (C) 2020-2021 HeteroDB,Inc <contact@heterodb.com>\n"
+		  "  Copyright (C) 2020-2021 KaiGai Kohei <kaigai@kaigai.gr.jp>\n",
 		  stderr);
 	exit(status);
 }
@@ -1415,18 +1451,19 @@ parse_options(int argc, char *argv[])
 		{"protocol",     required_argument, NULL, 'p'},
 		{"threads",      required_argument, NULL, 't'},
 		{"limit",        required_argument, NULL, 'l'},
-		{"chunk-size",   required_argument, NULL, 's'},
+		{"stat",         optional_argument, NULL, 's'},
 		{"rule",         required_argument, NULL, 'r'},
 		{"pcap-threads", required_argument, NULL, 1000},
 		{"direct-io",    no_argument,       NULL, 1001},
-		{"only-headers", no_argument,       NULL, 1002},
+		{"chunk-size",   required_argument, NULL, 1002},
+		{"only-headers", no_argument,       NULL, 1003},
 		{"help",         no_argument,       NULL, 'h'},
 		{NULL, 0, NULL, 0}
 	};
 	int		code;
 	char   *pos;
 
-	while ((code = getopt_long(argc, argv, "i:o:p:t:l:s:r:h",
+	while ((code = getopt_long(argc, argv, "i:o:p:t:l:s::r:h",
 							   long_options, NULL)) >= 0)
 	{
 		char	   *token, *end;
@@ -1480,13 +1517,6 @@ parse_options(int argc, char *argv[])
 				if (num_threads < 1)
 					Elog("invalid number of threads: %d", num_threads);
 				break;
-			case 1000:	/* pcap-threads */
-				num_pcap_threads = strtol(optarg, &pos, 10);
-				if (*pos != '\0')
-					Elog("invalid --pcap-threads argument: %s", optarg);
-				if (num_pcap_threads < 1)
-					Elog("invalid number of pcap-threads: %d", num_pcap_threads);
-				break;
 
 			case 'l':	/* limit */
 				output_filesize_limit = strtol(optarg, &pos, 10);
@@ -1503,7 +1533,36 @@ parse_options(int argc, char *argv[])
 					Elog("output filesize limit too small (should be > 64MB))");
 				break;
 
-			case 's':	/* chunk-size */
+			case 'r':	/* rule */
+				bpf_filter_rule = pstrdup(optarg);
+				break;
+
+			case 's':	/* stat */
+				if (!optarg)
+					print_stat_interval = 2;	/* 2s interval */
+				else
+				{
+					print_stat_interval = strtol(optarg, &pos, 10);
+					if (*pos != '\0')
+						Elog("invalid -s|--stat argument [%s]", optarg);
+					if (print_stat_interval <= 0)
+						Elog("invalid interval to print statistics [%s]", optarg);
+				}
+				break;
+
+			case 1000:	/* pcap-threads */
+				num_pcap_threads = strtol(optarg, &pos, 10);
+				if (*pos != '\0')
+					Elog("invalid --pcap-threads argument: %s", optarg);
+				if (num_pcap_threads < 1)
+					Elog("invalid number of pcap-threads: %d", num_pcap_threads);
+				break;
+
+			case 1001:	/* --direct-io */
+				enable_direct_io = true;
+				break;
+
+			case 1002:	/* chunk-size */
 				record_batch_threshold = strtol(optarg, &pos, 10);
 				if (strcasecmp(pos, "k") == 0 || strcasecmp(pos, "kb") == 0)
 					record_batch_threshold <<= 10;
@@ -1515,15 +1574,11 @@ parse_options(int argc, char *argv[])
 					Elog("unknown unit size '%s' in -s|--chunk-size option",
 						 optarg);
 				break;
-			case 'r':	/* rule */
-				bpf_filter_rule = pstrdup(optarg);
-				break;
-			case 1001:	/* --direct-io */
-				enable_direct_io = true;
-				break;
-			case 1002:	/* --only-headers */
+
+			case 1003:	/* --only-headers */
 				only_headers = true;
 				break;
+
 			default:
 				usage(code == 'h' ? 0 : 1);
 				break;
@@ -1579,6 +1634,8 @@ parse_options(int argc, char *argv[])
 		num_threads = 2 * NCPUS;
 	if (num_pcap_threads < 0)
 		num_pcap_threads = NCPUS;
+	if (!input_devname && print_stat_interval > 0)
+		Elog("-s|--stat option must be used with -i|--input=DEV option");
 }
 
 /*
@@ -1676,6 +1733,116 @@ arrowMergeChunkWriteOut(SQLtable *dchunk,
 			arrowChunkWriteOut(dchunk);
 		arrowCloseOutputFile(arrow_file_desc_current);
 	}
+}
+
+static void
+pcap_print_stat(bool is_final_call)
+{
+	static int		print_stat_count = 0;
+	static uint64_t last_raw_packet_length = 0;
+	static uint64_t last_ip4_packet_count = 0;
+	static uint64_t last_ip6_packet_count = 0;
+	static uint64_t last_tcp_packet_count = 0;
+	static uint64_t last_udp_packet_count = 0;
+	static uint64_t last_icmp_packet_count = 0;
+	static pfring_stat last_pfring_stat = {0,0,0};
+	uint64_t diff_raw_packet_length	= stat_raw_packet_length - last_raw_packet_length;
+	uint64_t diff_ip4_packet_count	= stat_ip4_packet_count - last_ip4_packet_count;
+	uint64_t diff_ip6_packet_count	= stat_ip6_packet_count - last_ip6_packet_count;
+	uint64_t diff_tcp_packet_count	= stat_tcp_packet_count - last_tcp_packet_count;
+	uint64_t diff_udp_packet_count	= stat_udp_packet_count - last_udp_packet_count;
+	uint64_t diff_icmp_packet_count	= stat_icmp_packet_count - last_icmp_packet_count;
+	pfring_stat	curr_pfring_stat;
+	char		linebuf[1024];
+	char	   *pos = linebuf;
+	time_t		t = time(NULL);
+	struct tm	tm;
+
+	localtime_r(&t, &tm);
+	pfring_stats(pd, &curr_pfring_stat);
+
+	if (is_final_call)
+	{
+		printf("Stats total:\n"
+			   "Recv packets: %lu\n"
+			   "Drop packets: %lu\n"
+			   "Total bytes: %lu\n",
+			   curr_pfring_stat.recv,
+			   curr_pfring_stat.drop,
+			   stat_raw_packet_length);
+		if ((protocol_mask & __PCAP_PROTO__IPv4) != 0)
+			printf("IPv4 packets: %lu\n", stat_ip4_packet_count);
+		if ((protocol_mask & __PCAP_PROTO__IPv6) != 0)
+			printf("IPv6 packets: %lu\n", stat_ip6_packet_count);
+		if ((protocol_mask & __PCAP_PROTO__TCP) != 0)
+			printf("TCP packets: %lu\n", stat_tcp_packet_count);
+		if ((protocol_mask & __PCAP_PROTO__UDP) != 0)
+			printf("UDP packets: %lu\n", stat_udp_packet_count);
+		if ((protocol_mask & __PCAP_PROTO__ICMP) != 0)
+			printf("ICMP packets: %lu\n", stat_icmp_packet_count);
+		return;
+	}
+	
+	if ((print_stat_count++ % 10) == 0)
+	{
+		pos += sprintf(pos,
+					   "%04d-%02d-%02d   <# Recv> <# Drop> <Total Sz>",
+					   tm.tm_year + 1900,
+                       tm.tm_mon + 1,
+                       tm.tm_mday);
+		if ((protocol_mask & __PCAP_PROTO__IPv4) != 0)
+			pos += sprintf(pos, " <# IPv4>");
+		if ((protocol_mask & __PCAP_PROTO__IPv6) != 0)
+			pos += sprintf(pos, " <# IPv6>");
+		if ((protocol_mask & __PCAP_PROTO__TCP) != 0)
+			pos += sprintf(pos, "  <# TCP>");
+		if ((protocol_mask & __PCAP_PROTO__UDP) != 0)
+			pos += sprintf(pos, "  <# UDP>");
+		if ((protocol_mask & __PCAP_PROTO__ICMP) != 0)
+			pos += sprintf(pos, " <# ICMP>");
+
+		puts(linebuf);
+		pos = linebuf;
+	}
+
+	pos += sprintf(pos,
+				   " %02d:%02d:%02d   % 8ld % 8ld",
+				   tm.tm_hour,
+				   tm.tm_min,
+				   tm.tm_sec,
+				   curr_pfring_stat.recv - last_pfring_stat.recv,
+				   curr_pfring_stat.drop - last_pfring_stat.drop);
+	if (diff_raw_packet_length < 10000UL)
+		pos += sprintf(pos, "  % 8ldB", diff_raw_packet_length);
+	else if (diff_raw_packet_length < 10240000UL)
+		pos += sprintf(pos, " % 8.2fKB",
+					   (double)diff_raw_packet_length / 1024.0);
+	else if (diff_raw_packet_length < 10485760000UL)
+		pos += sprintf(pos, " % 8.2fMB",
+					   (double)diff_raw_packet_length / 1048576.0);
+	else
+		pos += sprintf(pos, " % 8.2fGB",
+					   (double)diff_raw_packet_length / 1073741824.0);
+	
+	if ((protocol_mask & __PCAP_PROTO__IPv4) != 0)
+		pos += sprintf(pos, " % 8ld", diff_ip4_packet_count);
+	if ((protocol_mask & __PCAP_PROTO__IPv6) != 0)
+		pos += sprintf(pos, " % 8ld", diff_ip6_packet_count);
+	if ((protocol_mask & __PCAP_PROTO__TCP) != 0)
+		pos += sprintf(pos, " % 8ld", diff_tcp_packet_count);
+	if ((protocol_mask & __PCAP_PROTO__UDP) != 0)
+		pos += sprintf(pos, " % 8ld", diff_udp_packet_count);
+	if ((protocol_mask & __PCAP_PROTO__ICMP) != 0)
+		pos += sprintf(pos, " % 8ld", diff_icmp_packet_count);
+	puts(linebuf);
+
+	last_raw_packet_length	+= diff_raw_packet_length;
+	last_ip4_packet_count	+= diff_ip4_packet_count;
+	last_ip6_packet_count	+= diff_ip6_packet_count;
+	last_tcp_packet_count	+= diff_tcp_packet_count;
+	last_udp_packet_count	+= diff_udp_packet_count;
+	last_icmp_packet_count	+= diff_icmp_packet_count;
+	last_pfring_stat		= curr_pfring_stat;
 }
 
 int main(int argc, char *argv[])
@@ -1798,6 +1965,17 @@ int main(int argc, char *argv[])
 		rv = pthread_create(&workers[i], NULL, pcap_worker_main, (void *)i);
 		if (rv != 0)
 			Elog("failed on pthread_create: %s", strerror(rv));
+	}
+	/* print statistics */
+	if (pd && print_stat_interval > 0)
+	{
+		sleep(print_stat_interval);
+		while (!do_shutdown)
+		{
+			pcap_print_stat(false);
+			sleep(print_stat_interval);
+		}
+		pcap_print_stat(true);
 	}
 	/* wait for completion */
 	for (i=0; i < num_threads; i++)
