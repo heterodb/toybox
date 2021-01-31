@@ -70,7 +70,7 @@ typedef struct
 #define IP6ADDR_LEN			16
 
 /* command-line options */
-static char		   *input_pathname = NULL;
+static char		   *input_devname = NULL;
 static char		   *output_filename = "/tmp/pcap_%i_%y%m%d_%H:%M:%S.arrow";
 static int			protocol_mask = PCAP_PROTO__DEFAULT;
 static int			num_threads = -1;
@@ -95,10 +95,18 @@ static sem_t			pcap_worker_sem;
 #define PCAP_MAGIC__HOST_NS		0xa1b23c4dU
 #define PCAP_MAGIC__SWAP_NS		0x4d3cb2a1U
 
-static char			   *pcap_filemap = NULL;
-static uint32_t			pcap_file_magic = 0;
-static size_t			pcap_file_sz = 0UL;
-static uint64_t			pcap_file_read_pos = 0;
+typedef struct
+{
+	const char	   *pcap_filename;
+	char		   *pcap_filemap;
+	size_t			pcap_file_sz;
+	uint32_t		pcap_file_magic;
+	volatile off_t	pcap_file_read_pos;
+} pcapFileDesc;
+
+static pcapFileDesc	   *pcap_file_desc_array = NULL;
+static volatile int		pcap_file_desc_index = 0;
+static int				pcap_file_desc_nums = 0;
 
 /* other static variables */
 static long				PAGESIZE;
@@ -167,33 +175,6 @@ on_sigint_handler(int signal)
 		pfring_breakloop(pd);
 
 	errno = errno_saved;
-}
-
-/*
- * pcap_file_mmap - map pcap file and check header
- */
-static void *
-pcap_file_mmap(const char *pathname, struct stat *stat_buf)
-{
-	int		fdesc;
-	struct pcap_file_header *pcap_head;
-
-	fdesc = open(pathname, O_RDONLY);
-	if (fdesc < 0)
-		Elog("failed to open file '%s': %m", pathname);
-	pcap_head = mmap(NULL, stat_buf->st_size, PROT_READ, MAP_PRIVATE, fdesc, 0);
-	if (pcap_head == MAP_FAILED)
-		Elog("failed to mmap file '%s': %m", pathname);
-	close(fdesc);
-
-	/* check pcal file header */
-	Elog("right now pcap file read is not implemented yet");
-
-	pcap_file_magic = pcap_head->magic;
-	pcap_file_sz = stat_buf->st_size;
-	pcap_file_read_pos = sizeof(struct pcap_file_header);
-
-	return (void *)pcap_head;
 }
 
 /* ----------------------------------------------------------------
@@ -1020,7 +1001,7 @@ retry:
 				{
 					case 'i':
 						off += snprintf(path+off, sz-off,
-										"%s", input_pathname);
+										"%s", input_devname);
 						break;
 					case 'Y':
 						off += snprintf(path+off, sz-off,
@@ -1388,10 +1369,12 @@ pcap_worker_main(void *__arg)
 static int
 usage(int status)
 {
-	fputs("usage: pcap2arrow [OPTIONS]\n"
+	fputs("usage: pcap2arrow [OPTIONS] [<pcap files>...]\n"
 		  "\n"
 		  "OPTIONS:\n"
-		  "  -i|--input=<input device or pcap file>\n"
+		  "  -i|--input=<input device>\n"
+		  "      if no input device is given, pcap2arrow tries to read\n"
+		  "      packets from the pcap files; either of them must be given.\n"
 		  "  -o|--output=<output file; with format>\n"
 		  "      filename format can contains:"
 		  "        %i : interface name\n"
@@ -1417,7 +1400,8 @@ usage(int status)
 		  "     --direct-io : enables O_DIRECT for write-i/o\n"
 		  "  -h|--help    : shows this message\n"
 		  "\n"
-		  "  Copyright 2020-2021 - HeteroDB,Inc\n",
+		  "  Copyright (C) 2020-2021 HeteroDB,Inc <contact@heterodb.com>\n",
+		  "  Copyright (C) 2020-2021 KaiGai Kohei <kaigai@kaigai.gr.jp>\n"
 		  stderr);
 	exit(status);
 }
@@ -1450,9 +1434,9 @@ parse_options(int argc, char *argv[])
 		switch (code)
 		{
 			case 'i':	/* input */
-				if (input_pathname)
+				if (input_devname)
 					Elog("-i|--input was specified twice");
-				input_pathname = optarg;
+				input_devname = optarg;
 				break;
 			case 'o':	/* output */
 				output_filename = optarg;
@@ -1545,10 +1529,27 @@ parse_options(int argc, char *argv[])
 				break;
 		}
 	}
-	if (argc != optind)
-		Elog("unexpected tokens in the command line argument");
-	if (!input_pathname)
-		Elog("no input device or file was specified by -i|--input");
+
+	if (argc == optind)
+	{
+		if (!input_devname)
+			Elog("neither input device nor PCAP files were not given");
+	}
+	else
+	{
+		int		i, nfiles = argc - optind;
+
+		if (input_devname)
+			Elog("cannot use input device and PCAP file simultaneously");
+
+		pcap_file_desc_array = palloc0(sizeof(pcapFileDesc) * nfiles);
+		for (i=0; i < nfiles; i++)
+		{
+			pcap_file_desc_array[i].pcap_filename = pstrdup(argv[optind + i]);
+		}
+		pcap_file_desc_nums = nfiles;
+	}
+
 	for (pos = output_filename; *pos != '\0'; pos++)
 	{
 		if (*pos == '%')
@@ -1706,29 +1707,19 @@ int main(int argc, char *argv[])
 	pthreadMutexInit(&arrow_file_desc_lock);
 	if (sem_init(&pcap_worker_sem, 0, num_pcap_threads) != 0)
 		Elog("failed on sem_init: %m");
-	
-	/*
-	 * If -i|--input is a regular file, we try to open & mmap pcap file,
-	 * for parallel transformation to Apache Arrow.
-	 * Elsewhere, we assume the input_file is device name to be captured
-	 * using PF_RING module.
-	 */
-	if (stat(input_pathname, &stat_buf) == 0 &&
-		S_ISREG(stat_buf.st_mode))
+
+	if (input_devname)
 	{
-		pcap_filemap = pcap_file_mmap(input_pathname, &stat_buf);
-	}
-	else
-	{
+		/* Open the input device using PF-RING */
 		int		flags = (PF_RING_REENTRANT |
 						 PF_RING_TIMESTAMP |
 						 PF_RING_PROMISC);
 
-		pd = pfring_open(input_pathname, 65536, flags);
+		pd = pfring_open(input_devname, 65536, flags);
 		if (!pd)
 			Elog("failed on pfring_open: %m - "
 				 "pf_ring not loaded or interface %s is down?",
-				 input_pathname);
+				 input_devname);
 		rv = pfring_set_application_name(pd, "pcap2arrow");
 		if (rv)
 			Elog("failed on pfring_set_application_name");
@@ -1757,6 +1748,45 @@ int main(int argc, char *argv[])
 		if (rv)
 			Elog("failed on pfring_enable_ring");
 	}
+	else
+	{
+		/* Open the PCAP files */
+		Assert(pcap_file_desc_nums > 0);
+		for (i=0; i < pcap_file_desc_nums; i++)
+		{
+			pcapFileDesc *pcap = &pcap_file_desc_array[i];
+			struct pcap_file_header *pcap_head;
+			int			fdesc;
+
+			fdesc = open(pcap->pcap_filename, O_RDONLY);
+			if (fdesc < 0)
+				Elog("failed on open('%s'): %m", pcap->pcap_filename);
+			if (fstat(fdesc, &stat_buf) != 0)
+				Elog("failed on fstat('%s'): %m", pcap->pcap_filename);
+			pcap_head = mmap(NULL, stat_buf.st_size,
+							 PROT_READ,
+							 MAP_PRIVATE,
+							 fdesc, 0);
+			if (pcap_head != MAP_FAILED)
+				Elog("failed on mmap('%s', %zu): %m",
+					 pcap->pcap_filename,
+					 stat_buf.st_size);
+			close(fdesc);
+
+			if (pcap_head->magic != PCAP_MAGIC__HOST &&
+				pcap_head->magic != PCAP_MAGIC__SWAP &&
+				pcap_head->magic != PCAP_MAGIC__HOST_NS &&
+				pcap_head->magic != PCAP_MAGIC__SWAP_NS)
+				Elog("file '%s' may not have PCAP file format (magic: %08x)",
+					 pcap->pcap_filename, pcap_head->magic);
+
+			pcap->pcap_filemap = (char *)pcap_head;
+			pcap->pcap_file_sz = stat_buf.st_size;
+			pcap->pcap_file_magic = pcap_head->magic;
+			pcap->pcap_file_read_pos = sizeof(struct pcap_file_header);
+		}
+	}
+
 	/* ctrl-c handler */
 	signal(SIGINT, on_sigint_handler);
 	signal(SIGTERM, on_sigint_handler);
