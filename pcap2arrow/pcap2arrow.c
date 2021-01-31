@@ -71,7 +71,7 @@ typedef struct
 
 /* command-line options */
 static char		   *input_devname = NULL;
-static char		   *output_filename = "/tmp/pcap_%i_%y%m%d_%H:%M:%S.arrow";
+static char		   *output_filename = "/tmp/pcap_%i_%y%m%d_%H%M%S.arrow";
 static int			protocol_mask = PCAP_PROTO__DEFAULT;
 static int			num_threads = -1;
 static int			num_pcap_threads = -1;
@@ -83,11 +83,13 @@ static bool			only_headers = false;
 static int			print_stat_interval = -1;
 
 /* static variable for PF-RING capture mode */
-static pfring		   *pd = NULL;
+static pfring		  **pfring_desc_array = NULL;
+static uint64_t			pfring_desc_selector = 0;
+static int				pfring_desc_nums = -1;
 static volatile bool	do_shutdown = false;
 static pthread_mutex_t	arrow_file_desc_lock;
 static arrowFileDesc   *arrow_file_desc_current = NULL;
-static SQLtable		  **arrow_chunks_array;
+static SQLtable		  **arrow_chunks_array;		/* per-thread buffer */
 static sem_t			pcap_worker_sem;
 
 /* static variables for PCAP file scan mode */
@@ -105,18 +107,17 @@ typedef struct
 	volatile off_t	pcap_file_read_pos;
 } pcapFileDesc;
 
-static pcapFileDesc	   *pcap_file_desc_array = NULL;
-static volatile int		pcap_file_desc_index = 0;
-static int				pcap_file_desc_nums = 0;
+static pcapFileDesc		   *pcap_file_desc_array = NULL;
+static volatile int			pcap_file_desc_index = 0;
+static int					pcap_file_desc_nums = 0;
 
 /* capture statistics */
-static volatile uint64_t	stat_raw_packet_length = 0;
-static volatile uint64_t	stat_ip4_packet_count = 0;
-static volatile uint64_t	stat_ip6_packet_count = 0;
-static volatile uint64_t	stat_tcp_packet_count = 0;
-static volatile uint64_t	stat_udp_packet_count = 0;
-static volatile uint64_t	stat_icmp_packet_count = 0;
-static volatile uint64_t	stat_misc_packet_count = 0;
+static uint64_t		stat_raw_packet_length = 0;
+static uint64_t		stat_ip4_packet_count = 0;
+static uint64_t		stat_ip6_packet_count = 0;
+static uint64_t		stat_tcp_packet_count = 0;
+static uint64_t		stat_udp_packet_count = 0;
+static uint64_t		stat_icmp_packet_count = 0;
 
 /* other static variables */
 static long				PAGESIZE;
@@ -158,18 +159,15 @@ pthreadMutexUnlock(pthread_mutex_t *mutex)
  * atomic operations
  */
 static inline uint64_t
-atomicAdd64(volatile uint64_t *addr, uint64_t value)
+atomicRead64(const uint64_t *addr)
 {
-	return __atomic_fetch_add(addr, value, __ATOMIC_SEQ_CST);
+	return __atomic_load_n(addr, __ATOMIC_SEQ_CST);
 }
 
-static inline off_t
-atomicCAS64(volatile off_t *addr, off_t comp, off_t value)
+static inline uint64_t
+atomicAdd64(uint64_t *addr, uint64_t value)
 {
-	return __atomic_compare_exchange_n(addr, &comp, value,
-									   false,
-									   __ATOMIC_SEQ_CST,
-									   __ATOMIC_SEQ_CST);
+	return __atomic_fetch_add(addr, value, __ATOMIC_SEQ_CST);
 }
 
 /*
@@ -179,11 +177,14 @@ static void
 on_sigint_handler(int signal)
 {
 	int		errno_saved = errno;
+	int		i;
 
 	do_shutdown = true;
-	if (pd)
-		pfring_breakloop(pd);
-
+	if (pfring_desc_array)
+	{
+		for (i=0; i < pfring_desc_nums; i++)
+			pfring_breakloop(pfring_desc_array[i]);
+	}
 	errno = errno_saved;
 }
 
@@ -1334,7 +1335,7 @@ fillup_by_null:
  * execCapturePackets
  */
 static int
-execCapturePackets(SQLtable *chunk)
+execCapturePackets(pfring *pd, SQLtable *chunk)
 {
 	struct pfring_pkthdr hdr;
 	u_char		__buffer[65536];
@@ -1384,7 +1385,13 @@ pcap_worker_main(void *__arg)
 		 */
 		if (!do_shutdown)
 		{
-			status = execCapturePackets(chunk);
+			pfring	   *pd;
+			int			index;
+
+			index = atomicAdd64(&pfring_desc_selector, 1) % pfring_desc_nums;
+			pd = pfring_desc_array[index];
+
+			status = execCapturePackets(pd, chunk);
 			Assert(status >= 0);
 		}
 		if (sem_post(&pcap_worker_sem) != 0)
@@ -1434,6 +1441,7 @@ usage(int status)
 		  "     --only-headers: disables capture of payload\n"
 		  "     --chunk-size=<SIZE> : size of record batch (default: 128MB)\n"
 		  "     --direct-io : enables O_DIRECT for write-i/o\n"
+		  "     --num-queues=<N_QUEUE> : number of packet capturing queue.\n"
 		  "  -h|--help    : shows this message\n"
 		  "\n"
 		  "  Copyright (C) 2020-2021 HeteroDB,Inc <contact@heterodb.com>\n"
@@ -1457,6 +1465,7 @@ parse_options(int argc, char *argv[])
 		{"direct-io",    no_argument,       NULL, 1001},
 		{"chunk-size",   required_argument, NULL, 1002},
 		{"only-headers", no_argument,       NULL, 1003},
+		{"num-queues",   required_argument, NULL, 1004},
 		{"help",         no_argument,       NULL, 'h'},
 		{NULL, 0, NULL, 0}
 	};
@@ -1579,6 +1588,12 @@ parse_options(int argc, char *argv[])
 				only_headers = true;
 				break;
 
+			case 1004:	/* --num-queues */
+				pfring_desc_nums = strtol(optarg, &pos, 10);
+				if (*pos != '\0' || pfring_desc_nums < 1)
+					Elog("invalid --num-queues argument: %s", optarg);
+				break;
+
 			default:
 				usage(code == 'h' ? 0 : 1);
 				break;
@@ -1634,6 +1649,8 @@ parse_options(int argc, char *argv[])
 		num_threads = 2 * NCPUS;
 	if (num_pcap_threads < 0)
 		num_pcap_threads = NCPUS;
+	if (pfring_desc_nums < 0)
+		pfring_desc_nums = (num_threads > 24 ? num_threads / 6 : 4);
 	if (!input_devname && print_stat_interval > 0)
 		Elog("-s|--stat option must be used with -i|--input=DEV option");
 }
@@ -1746,20 +1763,28 @@ pcap_print_stat(bool is_final_call)
 	static uint64_t last_udp_packet_count = 0;
 	static uint64_t last_icmp_packet_count = 0;
 	static pfring_stat last_pfring_stat = {0,0,0};
-	uint64_t diff_raw_packet_length	= stat_raw_packet_length - last_raw_packet_length;
-	uint64_t diff_ip4_packet_count	= stat_ip4_packet_count - last_ip4_packet_count;
-	uint64_t diff_ip6_packet_count	= stat_ip6_packet_count - last_ip6_packet_count;
-	uint64_t diff_tcp_packet_count	= stat_tcp_packet_count - last_tcp_packet_count;
-	uint64_t diff_udp_packet_count	= stat_udp_packet_count - last_udp_packet_count;
-	uint64_t diff_icmp_packet_count	= stat_icmp_packet_count - last_icmp_packet_count;
-	pfring_stat	curr_pfring_stat;
+	uint64_t curr_raw_packet_length = atomicRead64(&stat_raw_packet_length);
+	uint64_t curr_ip4_packet_count = atomicRead64(&stat_ip4_packet_count);
+	uint64_t curr_ip6_packet_count = atomicRead64(&stat_ip6_packet_count);
+	uint64_t curr_tcp_packet_count = atomicRead64(&stat_tcp_packet_count);
+	uint64_t curr_udp_packet_count = atomicRead64(&stat_udp_packet_count);
+	uint64_t curr_icmp_packet_count = atomicRead64(&stat_icmp_packet_count);
+	uint64_t diff_raw_packet_length;
+	pfring_stat	curr_pfring_stat, temp;
 	char		linebuf[1024];
 	char	   *pos = linebuf;
 	time_t		t = time(NULL);
 	struct tm	tm;
+	int			i;
 
 	localtime_r(&t, &tm);
-	pfring_stats(pd, &curr_pfring_stat);
+	pfring_stats(pfring_desc_array[0], &curr_pfring_stat);
+	for (i=1; i < pfring_desc_nums; i++)
+	{
+		pfring_stats(pfring_desc_array[i], &temp);
+		curr_pfring_stat.recv += temp.recv;
+		curr_pfring_stat.drop += temp.drop;
+	}
 
 	if (is_final_call)
 	{
@@ -1769,17 +1794,17 @@ pcap_print_stat(bool is_final_call)
 			   "Total bytes: %lu\n",
 			   curr_pfring_stat.recv,
 			   curr_pfring_stat.drop,
-			   stat_raw_packet_length);
+			   curr_raw_packet_length);
 		if ((protocol_mask & __PCAP_PROTO__IPv4) != 0)
-			printf("IPv4 packets: %lu\n", stat_ip4_packet_count);
+			printf("IPv4 packets: %lu\n", curr_ip4_packet_count);
 		if ((protocol_mask & __PCAP_PROTO__IPv6) != 0)
-			printf("IPv6 packets: %lu\n", stat_ip6_packet_count);
+			printf("IPv6 packets: %lu\n", curr_ip6_packet_count);
 		if ((protocol_mask & __PCAP_PROTO__TCP) != 0)
-			printf("TCP packets: %lu\n", stat_tcp_packet_count);
+			printf("TCP packets: %lu\n", curr_tcp_packet_count);
 		if ((protocol_mask & __PCAP_PROTO__UDP) != 0)
-			printf("UDP packets: %lu\n", stat_udp_packet_count);
+			printf("UDP packets: %lu\n", curr_udp_packet_count);
 		if ((protocol_mask & __PCAP_PROTO__ICMP) != 0)
-			printf("ICMP packets: %lu\n", stat_icmp_packet_count);
+			printf("ICMP packets: %lu\n", curr_icmp_packet_count);
 		return;
 	}
 	
@@ -1812,6 +1837,7 @@ pcap_print_stat(bool is_final_call)
 				   tm.tm_sec,
 				   curr_pfring_stat.recv - last_pfring_stat.recv,
 				   curr_pfring_stat.drop - last_pfring_stat.drop);
+	diff_raw_packet_length = curr_raw_packet_length - last_raw_packet_length;
 	if (diff_raw_packet_length < 10000UL)
 		pos += sprintf(pos, "  % 8ldB", diff_raw_packet_length);
 	else if (diff_raw_packet_length < 10240000UL)
@@ -1825,23 +1851,28 @@ pcap_print_stat(bool is_final_call)
 					   (double)diff_raw_packet_length / 1073741824.0);
 	
 	if ((protocol_mask & __PCAP_PROTO__IPv4) != 0)
-		pos += sprintf(pos, " % 8ld", diff_ip4_packet_count);
+		pos += sprintf(pos, " % 8ld", (curr_ip4_packet_count -
+									   last_ip4_packet_count));
 	if ((protocol_mask & __PCAP_PROTO__IPv6) != 0)
-		pos += sprintf(pos, " % 8ld", diff_ip6_packet_count);
+		pos += sprintf(pos, " % 8ld", (curr_ip6_packet_count -
+									   last_ip6_packet_count));
 	if ((protocol_mask & __PCAP_PROTO__TCP) != 0)
-		pos += sprintf(pos, " % 8ld", diff_tcp_packet_count);
+		pos += sprintf(pos, " % 8ld", (curr_tcp_packet_count -
+									   last_tcp_packet_count));
 	if ((protocol_mask & __PCAP_PROTO__UDP) != 0)
-		pos += sprintf(pos, " % 8ld", diff_udp_packet_count);
+		pos += sprintf(pos, " % 8ld", (curr_udp_packet_count -
+									   last_udp_packet_count));
 	if ((protocol_mask & __PCAP_PROTO__ICMP) != 0)
-		pos += sprintf(pos, " % 8ld", diff_icmp_packet_count);
+		pos += sprintf(pos, " % 8ld", (curr_icmp_packet_count -
+									   last_icmp_packet_count));
 	puts(linebuf);
 
-	last_raw_packet_length	+= diff_raw_packet_length;
-	last_ip4_packet_count	+= diff_ip4_packet_count;
-	last_ip6_packet_count	+= diff_ip6_packet_count;
-	last_tcp_packet_count	+= diff_tcp_packet_count;
-	last_udp_packet_count	+= diff_udp_packet_count;
-	last_icmp_packet_count	+= diff_icmp_packet_count;
+	last_raw_packet_length	= curr_raw_packet_length;
+	last_ip4_packet_count	= curr_ip4_packet_count;
+	last_ip6_packet_count	= curr_ip6_packet_count;
+	last_tcp_packet_count	= curr_tcp_packet_count;
+	last_udp_packet_count	= curr_udp_packet_count;
+	last_icmp_packet_count	= curr_icmp_packet_count;
 	last_pfring_stat		= curr_pfring_stat;
 }
 
@@ -1878,42 +1909,55 @@ int main(int argc, char *argv[])
 	if (input_devname)
 	{
 		/* Open the input device using PF-RING */
-		int		flags = (PF_RING_REENTRANT |
-						 PF_RING_TIMESTAMP |
-						 PF_RING_PROMISC);
+		uint32_t	cluster_id = (uint32_t)getpid();
 
-		pd = pfring_open(input_devname, 65536, flags);
-		if (!pd)
-			Elog("failed on pfring_open: %m - "
-				 "pf_ring not loaded or interface %s is down?",
-				 input_devname);
-		rv = pfring_set_application_name(pd, "pcap2arrow");
-		if (rv)
-			Elog("failed on pfring_set_application_name");
-
-		//NOTE: Is rx_only_direction right?
-		rv = pfring_set_direction(pd, rx_only_direction);
-		if (rv)
-			Elog("failed on pfring_set_direction");
-
-		rv = pfring_set_poll_duration(pd, 50);
-		if (rv)
-			Elog("failed on pfring_set_poll_duration");
-		
-		rv = pfring_set_socket_mode(pd, recv_only_mode);
-		if (rv)
-			Elog("failed on pfring_set_socket_mode");
-
-		if (bpf_filter_rule)
+		pfring_desc_array = palloc0(sizeof(pfring *) * pfring_desc_nums);
+		for (i=0; i < pfring_desc_nums; i++)
 		{
-			rv = pfring_set_bpf_filter(pd, bpf_filter_rule);
-			if (rv)
-				Elog("failed on pfring_set_bpf_filter");
-		}
+			pfring *pd;
 
-		rv = pfring_enable_ring(pd);
-		if (rv)
-			Elog("failed on pfring_enable_ring");
+			pd = pfring_open(input_devname, 65536,
+							 PF_RING_REENTRANT |
+							 PF_RING_TIMESTAMP |
+							 PF_RING_PROMISC);
+			if (!pd)
+				Elog("failed on pfring_open: %m - "
+					 "pf_ring not loaded or interface %s is down?",
+					 input_devname);
+			rv = pfring_set_application_name(pd, "pcap2arrow");
+			if (rv)
+				Elog("failed on pfring_set_application_name");
+
+			//NOTE: Is rx_only_direction right?
+			rv = pfring_set_direction(pd, rx_only_direction);
+			if (rv)
+				Elog("failed on pfring_set_direction");
+
+			rv = pfring_set_poll_duration(pd, 50);
+			if (rv)
+				Elog("failed on pfring_set_poll_duration");
+
+			rv = pfring_set_socket_mode(pd, recv_only_mode);
+			if (rv)
+				Elog("failed on pfring_set_socket_mode");
+
+			if (bpf_filter_rule)
+			{
+				rv = pfring_set_bpf_filter(pd, bpf_filter_rule);
+				if (rv)
+					Elog("failed on pfring_set_bpf_filter");
+			}
+
+			rv = pfring_set_cluster(pd, cluster_id, cluster_round_robin);
+			if (rv)
+				Elog("failed on pfring_set_cluster");
+
+			rv = pfring_enable_ring(pd);
+			if (rv)
+				Elog("failed on pfring_enable_ring");
+
+			pfring_desc_array[i] = pd;
+		}
 	}
 	else
 	{
@@ -1967,7 +2011,7 @@ int main(int argc, char *argv[])
 			Elog("failed on pthread_create: %s", strerror(rv));
 	}
 	/* print statistics */
-	if (pd && print_stat_interval > 0)
+	if (pfring_desc_array && print_stat_interval > 0)
 	{
 		sleep(print_stat_interval);
 		while (!do_shutdown)
