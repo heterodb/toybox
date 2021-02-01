@@ -83,7 +83,12 @@ static pthread_mutex_t *arrow_file_desc_locks;
 static arrowFileDesc  **arrow_file_desc_array = NULL;
 static uint64_t			arrow_file_desc_selector = 0;
 static int				arrow_file_desc_nums = 1;
-//static arrowFileDesc   *arrow_file_desc_current = NULL;
+
+/* static variables for worker threads */
+//static pthread_mutex_t *arrow_workers_blocker;	/* per-thread blocker mutex */
+static pthread_mutex_t	arrow_workers_mutex;
+static pthread_cond_t	arrow_workers_cond;
+static bool			   *arrow_workers_completed;
 static SQLtable		  **arrow_chunks_array;		/* per-thread buffer */
 static sem_t			pcap_worker_sem;
 
@@ -122,7 +127,7 @@ static uint64_t		stat_icmp_packet_count = 0;
 /* other static variables */
 static long				PAGESIZE;
 static long				NCPUS;
-static __thread int		worker_id = -1;
+static __thread long	worker_id = -1;
 static volatile bool	do_shutdown = false;
 
 #if __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
@@ -154,6 +159,27 @@ pthreadMutexUnlock(pthread_mutex_t *mutex)
 {
 	if ((errno = pthread_mutex_unlock(mutex)) != 0)
         Elog("failed on pthread_mutex_unlock: %m");
+}
+
+static inline void
+pthreadCondInit(pthread_cond_t *cond)
+{
+	if ((errno = pthread_cond_init(cond, NULL)) != 0)
+        Elog("failed on pthread_cond_init: %m");
+}
+
+static inline void
+pthreadCondWait(pthread_cond_t *cond, pthread_mutex_t *mutex)
+{
+	if ((errno = pthread_cond_wait(cond, mutex)) != 0)
+		Elog("failed on pthread_cond_wait: %m");
+}
+
+static inline void
+pthreadCondBroadcast(pthread_cond_t *cond)
+{
+	if ((errno = pthread_cond_broadcast(cond)) != 0)
+		Elog("failed on pthread_cond_broadcast: %m");
 }
 
 /*
@@ -1212,6 +1238,94 @@ arrowChunkWriteOut(SQLtable *chunk)
 }
 
 /*
+ * arrowMergeChunkWriteOut
+ */
+static inline void
+__arrowMergeChunkOneRow(SQLtable *dchunk,
+						SQLtable *schunk, size_t index)
+{
+	size_t		usage = 0;
+	int			j;
+
+	Assert(dchunk->nfields == schunk->nfields);
+	for (j=0; j < schunk->nfields; j++)
+	{
+		SQLfield   *dcolumn = &dchunk->columns[j];
+		SQLfield   *scolumn = &schunk->columns[j];
+		void	   *addr;
+		size_t		sz, off;
+		uint64_t	val;
+		struct timeval ts_buf;
+
+		Assert(schunk->nitems == scolumn->nitems);
+		if ((scolumn->nullmap.data[index>>3] & (1<<(index&7))) == 0)
+		{
+			usage += dcolumn->put_value(dcolumn, NULL, 0);
+			continue;
+		}
+
+		Assert(scolumn->arrow_type.node.tag == dcolumn->arrow_type.node.tag);
+		switch (scolumn->arrow_type.node.tag)
+		{
+			case ArrowNodeTag__Timestamp:
+				Assert(scolumn->arrow_type.Timestamp.unit == ArrowTimeUnit__MicroSecond);
+				val = ((uint64_t *)scolumn->values.data)[index];
+				ts_buf.tv_sec = val / 1000000;
+				ts_buf.tv_usec = val % 1000000;
+				sz = sizeof(struct timeval);
+				addr = &ts_buf;
+				break;
+
+			case ArrowNodeTag__Int:
+				sz = scolumn->arrow_type.Int.bitWidth / 8;
+				Assert(sz == sizeof(uint8_t)  ||
+					   sz == sizeof(uint16_t) ||
+					   sz == sizeof(uint32_t) ||
+					   sz == sizeof(uint64_t));
+				addr = scolumn->values.data + sz * index;
+				break;
+
+			case ArrowNodeTag__Binary:
+				off = ((uint32_t *)scolumn->values.data)[index];
+				sz = ((uint32_t *)scolumn->values.data)[index+1] - off;
+				addr = scolumn->extra.data + off;
+				break;
+
+			case ArrowNodeTag__FixedSizeBinary:
+				sz = scolumn->arrow_type.FixedSizeBinary.byteWidth;
+				addr = scolumn->values.data + sz * index;
+				break;
+
+			default:
+				Elog("Bug? unexpected ArrowType (tag: %d)",
+					 scolumn->arrow_type.node.tag);
+		}
+		usage += dcolumn->put_value(dcolumn, addr, sz);
+	}
+	dchunk->nitems++;
+	dchunk->usage = usage;
+}
+
+static void
+arrowMergeChunkWriteOut(SQLtable *dchunk, SQLtable *schunk)
+{
+	size_t		i;
+	
+	for (i=0; i < schunk->nitems; i++)
+	{
+		/* merge one row */
+		__arrowMergeChunkOneRow(dchunk, schunk, i);
+
+		/* write out buffer */
+		if (dchunk->usage >= record_batch_threshold)
+		{
+			arrowChunkWriteOut(dchunk);
+			sql_table_clear(dchunk);
+		}
+	}
+}
+
+/*
  * __execCaptureOnePacket
  */
 static inline void
@@ -1368,6 +1482,8 @@ static void *
 pcap_worker_main(void *__arg)
 {
 	SQLtable   *chunk;
+	int			phase;
+	int			buddy;
 
 	/* assign worker-id of this thread */
 	worker_id = (long)__arg;
@@ -1381,7 +1497,7 @@ pcap_worker_main(void *__arg)
 		{
 			if (errno == EINTR)
 				continue;
-			Elog("worker-%d: failed on sem_wait: %m", worker_id);
+			Elog("worker-%ld: failed on sem_wait: %m", worker_id);
 		}
 		/*
 		 * Ok, Go to packet capture
@@ -1403,6 +1519,32 @@ pcap_worker_main(void *__arg)
 		if (status > 0)
 			arrowChunkWriteOut(chunk);
 	}
+	/* merge pending chunks */
+	for (phase = 0; (worker_id & ((1UL << (phase + 1)) - 1)) == 0; phase++)
+	{
+		buddy = worker_id + (1UL << phase);
+
+		if (buddy >= num_threads)
+			break;
+		pthreadMutexLock(&arrow_workers_mutex);
+		while (!arrow_workers_completed[buddy])
+		{
+			pthreadCondWait(&arrow_workers_cond,
+							&arrow_workers_mutex);
+		}
+		pthreadMutexUnlock(&arrow_workers_mutex);
+
+		arrowMergeChunkWriteOut(chunk, arrow_chunks_array[buddy]);
+	}
+	if (worker_id == 0 && chunk->nitems > 0)
+		arrowChunkWriteOut(chunk);
+	
+	/* Ok, this worker exit */
+	pthreadMutexLock(&arrow_workers_mutex);
+	arrow_workers_completed[worker_id] = true;
+	pthreadCondBroadcast(&arrow_workers_cond);
+	pthreadMutexUnlock(&arrow_workers_mutex);
+
 	return NULL;
 }
 
@@ -1613,7 +1755,7 @@ parse_options(int argc, char *argv[])
 		}
 	}
 
-	if (argc == optind)
+	if (argc == optind + 1)
 	{
 		if (!input_devname)
 			Elog("neither input device nor PCAP files were not given");
@@ -1623,7 +1765,7 @@ parse_options(int argc, char *argv[])
 		int		i, nfiles = argc - optind;
 
 		if (input_devname)
-			Elog("cannot use input device and PCAP file simultaneously");
+			Elog("cannot use input device and PCAP file simultaneously %d %d", argc, optind);
 
 		pcap_file_desc_array = palloc0(sizeof(pcapFileDesc) * nfiles);
 		for (i=0; i < nfiles; i++)
@@ -1666,99 +1808,6 @@ parse_options(int argc, char *argv[])
 		pfring_desc_nums = (num_threads > 24 ? num_threads / 6 : 4);
 	if (!input_devname && print_stat_interval > 0)
 		Elog("-s|--stat option must be used with -i|--input=DEV option");
-}
-
-/*
- * arrowMergeChunkWriteOut
- */
-static inline void
-__arrowMergeChunkOneRow(SQLtable *dchunk,
-						SQLtable *schunk, size_t index)
-{
-	size_t		usage = 0;
-	int			j;
-
-	Assert(dchunk->nfields == schunk->nfields);
-	for (j=0; j < schunk->nfields; j++)
-	{
-		SQLfield   *dcolumn = &dchunk->columns[j];
-		SQLfield   *scolumn = &schunk->columns[j];
-		void	   *addr;
-		size_t		sz, off;
-		uint64_t	val;
-		struct timeval ts_buf;
-
-		Assert(schunk->nitems == scolumn->nitems);
-		if ((scolumn->nullmap.data[index>>3] & (1<<(index&7))) == 0)
-		{
-			usage += dcolumn->put_value(dcolumn, NULL, 0);
-			continue;
-		}
-
-		Assert(scolumn->arrow_type.node.tag == dcolumn->arrow_type.node.tag);
-		switch (scolumn->arrow_type.node.tag)
-		{
-			case ArrowNodeTag__Timestamp:
-				Assert(scolumn->arrow_type.Timestamp.unit == ArrowTimeUnit__MicroSecond);
-				val = ((uint64_t *)scolumn->values.data)[index];
-				ts_buf.tv_sec = val / 1000000;
-				ts_buf.tv_usec = val % 1000000;
-				sz = sizeof(struct timeval);
-				addr = &ts_buf;
-				break;
-
-			case ArrowNodeTag__Int:
-				sz = scolumn->arrow_type.Int.bitWidth / 8;
-				Assert(sz == sizeof(uint8_t)  ||
-					   sz == sizeof(uint16_t) ||
-					   sz == sizeof(uint32_t) ||
-					   sz == sizeof(uint64_t));
-				addr = scolumn->values.data + sz * index;
-				break;
-
-			case ArrowNodeTag__Binary:
-				off = ((uint32_t *)scolumn->values.data)[index];
-				sz = ((uint32_t *)scolumn->values.data)[index+1] - off;
-				addr = scolumn->extra.data + off;
-				break;
-
-			case ArrowNodeTag__FixedSizeBinary:
-				sz = scolumn->arrow_type.FixedSizeBinary.byteWidth;
-				addr = scolumn->values.data + sz * index;
-				break;
-
-			default:
-				Elog("Bug? unexpected ArrowType (tag: %d)",
-					 scolumn->arrow_type.node.tag);
-		}
-		usage += dcolumn->put_value(dcolumn, addr, sz);
-	}
-	dchunk->nitems++;
-	dchunk->usage = usage;
-}
-
-static void
-arrowMergeChunkWriteOut(SQLtable *dchunk,
-						SQLtable *schunk,
-						bool is_last_buddy)
-{
-	size_t		i;
-	
-	for (i=0; i < schunk->nitems; i++)
-	{
-		/* merge one row */
-		__arrowMergeChunkOneRow(dchunk, schunk, i);
-
-		/* write out buffer */
-		if (dchunk->usage >= record_batch_threshold)
-		{
-			arrowChunkWriteOut(dchunk);
-			sql_table_clear(dchunk);
-		}
-	}
-
-	if (is_last_buddy && dchunk->nitems > 0)
-		arrowChunkWriteOut(dchunk);
 }
 
 static void
@@ -2038,6 +2087,10 @@ int main(int argc, char *argv[])
 	signal(SIGTERM, on_sigint_handler);
 	
 	/* launch worker threads */
+	pthreadMutexInit(&arrow_workers_mutex);
+	pthreadCondInit(&arrow_workers_cond);
+	arrow_workers_completed = palloc0(sizeof(bool) * num_threads);
+
 	workers = alloca(sizeof(pthread_t) * num_threads);
 	for (i=0; i < num_threads; i++)
 	{
@@ -2063,16 +2116,9 @@ int main(int argc, char *argv[])
 		if (rv != 0)
 			Elog("failed on pthread_join: %s", strerror(rv));
 	}
-	/* write out pending chunks */
-	for (i=1; i < num_threads; i++)
-	{
-		arrowMergeChunkWriteOut(arrow_chunks_array[0],
-								arrow_chunks_array[i],
-								i == num_threads - 1);
-	}
+	/* close the output files */
 	for (i=0; i < arrow_file_desc_nums; i++)
 		arrowCloseOutputFile(arrow_file_desc_array[i]);
-		
 	return 0;
 }
 
