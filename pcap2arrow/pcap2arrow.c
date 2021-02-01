@@ -52,23 +52,6 @@
 #define PCAP_SWITCH__PER_WEEK		4
 #define PCAP_SWITCH__PER_MONTH		5
 
-/*
- * arrowFileDesc
- */
-typedef struct
-{
-	int				refcnt;
-	SQLtable		table;
-} arrowFileDesc;
-#define PCAP_SCHEMA_MAX_NFIELDS		50
-
-/*
- * misc definitions
- */
-#define MACADDR_LEN			6
-#define IP4ADDR_LEN			4
-#define IP6ADDR_LEN			16
-
 /* command-line options */
 static char		   *input_devname = NULL;
 static char		   *output_filename = "/tmp/pcap_%i_%y%m%d_%H%M%S.arrow";
@@ -82,15 +65,32 @@ static bool			enable_direct_io = false;
 static bool			only_headers = false;
 static int			print_stat_interval = -1;
 
+/*
+ * definition of output Arrow files
+ */
+typedef struct
+{
+	int				refcnt;
+	SQLtable		table;
+} arrowFileDesc;
+#define PCAP_SCHEMA_MAX_NFIELDS		50
+
+#define MACADDR_LEN			6
+#define IP4ADDR_LEN			4
+#define IP6ADDR_LEN			16
+
+static pthread_mutex_t *arrow_file_desc_locks;
+static arrowFileDesc  **arrow_file_desc_array = NULL;
+static uint64_t			arrow_file_desc_selector = 0;
+static int				arrow_file_desc_nums = 1;
+//static arrowFileDesc   *arrow_file_desc_current = NULL;
+static SQLtable		  **arrow_chunks_array;		/* per-thread buffer */
+static sem_t			pcap_worker_sem;
+
 /* static variable for PF-RING capture mode */
 static pfring		  **pfring_desc_array = NULL;
 static uint64_t			pfring_desc_selector = 0;
 static int				pfring_desc_nums = -1;
-static volatile bool	do_shutdown = false;
-static pthread_mutex_t	arrow_file_desc_lock;
-static arrowFileDesc   *arrow_file_desc_current = NULL;
-static SQLtable		  **arrow_chunks_array;		/* per-thread buffer */
-static sem_t			pcap_worker_sem;
 
 /* static variables for PCAP file scan mode */
 #define PCAP_MAGIC__HOST		0xa1b2c3d4U
@@ -123,6 +123,7 @@ static uint64_t		stat_icmp_packet_count = 0;
 static long				PAGESIZE;
 static long				NCPUS;
 static __thread int		worker_id = -1;
+static volatile bool	do_shutdown = false;
 
 #if __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
 #define __ntoh16(x)		__builtin_bswap16(x)
@@ -1050,7 +1051,7 @@ retry:
 						break;
 					case 'q':
 						off += snprintf(path+off, sz-off,
-										"%d", output_file_seqno);
+										"%d", output_file_seqno++);
 						break;
 					default:
 						Elog("unexpected output file format '%%%c'", *pos);
@@ -1128,6 +1129,7 @@ arrowChunkWriteOut(SQLtable *chunk)
 	ArrowBlock	block;
 	size_t		meta_sz;
 	size_t		length;
+	int			f_index;
 	bool		close_file = false;
 
 	/*
@@ -1139,10 +1141,11 @@ arrowChunkWriteOut(SQLtable *chunk)
 	/*
 	 * attach file descriptor
 	 */
-	pthreadMutexLock(&arrow_file_desc_lock);
+	f_index = atomicAdd64(&arrow_file_desc_selector, 1) % arrow_file_desc_nums;
+	pthreadMutexLock(&arrow_file_desc_locks[f_index]);
 	for (;;)
 	{
-		outfd = arrow_file_desc_current;
+		outfd = arrow_file_desc_array[f_index];
 		if (outfd->table.f_pos < output_filesize_limit)
 		{
 			/* Ok, [base ... base + usage) is reserved */
@@ -1157,17 +1160,17 @@ arrowChunkWriteOut(SQLtable *chunk)
 		else
 		{
 			/* exceeds the limit, so switch the output file */
-			arrow_file_desc_current = arrowOpenOutputFile();
+			arrow_file_desc_array[f_index] = arrowOpenOutputFile();
 			if (outfd->refcnt == 0)
 			{
-				pthreadMutexUnlock(&arrow_file_desc_lock);
+				pthreadMutexUnlock(&arrow_file_desc_locks[f_index]);
 				/* ...and close the file, if nobody is writing */
 				arrowCloseOutputFile(outfd);
-				pthreadMutexLock(&arrow_file_desc_lock);
+				pthreadMutexLock(&arrow_file_desc_locks[f_index]);
 			}
 		}
 	}
-	pthreadMutexUnlock(&arrow_file_desc_lock);
+	pthreadMutexUnlock(&arrow_file_desc_locks[f_index]);
 
 	/* ok, write out record batch (see writeArrowRecordBatch) */
 	Assert(chunk->__iov_cnt > 0 &&
@@ -1185,7 +1188,7 @@ arrowChunkWriteOut(SQLtable *chunk)
 	/*
 	 * Ok, append ArrowBlock and detach file descriptor
 	 */
-	pthreadMutexLock(&arrow_file_desc_lock);
+	pthreadMutexLock(&arrow_file_desc_locks[f_index]);
 	if (!outfd->table.recordBatches)
 		outfd->table.recordBatches = palloc0(sizeof(ArrowBlock) * 40);
 	else
@@ -1196,9 +1199,9 @@ arrowChunkWriteOut(SQLtable *chunk)
 	outfd->table.recordBatches[outfd->table.numRecordBatches++] = block;
 
 	Assert(outfd->refcnt > 0);
-	if (--outfd->refcnt == 0 && arrow_file_desc_current != outfd)
+	if (--outfd->refcnt == 0 && arrow_file_desc_array[f_index] != outfd)
 		close_file = true;
-	pthreadMutexUnlock(&arrow_file_desc_lock);
+	pthreadMutexUnlock(&arrow_file_desc_locks[f_index]);
 	if (close_file)
 		arrowCloseOutputFile(outfd);
 
@@ -1424,8 +1427,11 @@ usage(int status)
 		  "         %H : hour in 2-digits\n"
 		  "         %M : minute in 2-digits\n"
 		  "         %S : second in 2-digits\n"
-		  "         %q : sequence number when file is switched by -l|--limit\n"
-		  "       default is '/tmp/pcap_%y%m%d_%H:%M:%S_%i_%i.arrow'\n"
+		  "         %q : sequence number for each output files\n"
+		  "       default is '/tmp/pcap_%y%m%d_%H%M%S_%i_%q.arrow'\n"
+		  "     --parallel-write=N_FILES\n"
+		  "       enables to open multiple output files simultaneously.\n"
+		  "       (default: 1)\n"
 		  "  -p|--protocol=<PROTO>\n"
 		  "       <PROTO> is a comma separated string contains\n"
 		  "       the following tokens:\n"
@@ -1454,23 +1460,24 @@ static void
 parse_options(int argc, char *argv[])
 {
 	static struct option long_options[] = {
-		{"input",        required_argument, NULL, 'i'},
-		{"output",       required_argument, NULL, 'o'},
-		{"protocol",     required_argument, NULL, 'p'},
-		{"threads",      required_argument, NULL, 't'},
-		{"limit",        required_argument, NULL, 'l'},
-		{"stat",         optional_argument, NULL, 's'},
-		{"rule",         required_argument, NULL, 'r'},
-		{"pcap-threads", required_argument, NULL, 1000},
-		{"direct-io",    no_argument,       NULL, 1001},
-		{"chunk-size",   required_argument, NULL, 1002},
-		{"only-headers", no_argument,       NULL, 1003},
-		{"num-queues",   required_argument, NULL, 1004},
-		{"help",         no_argument,       NULL, 'h'},
+		{"input",          required_argument, NULL, 'i'},
+		{"output",         required_argument, NULL, 'o'},
+		{"protocol",       required_argument, NULL, 'p'},
+		{"threads",        required_argument, NULL, 't'},
+		{"limit",          required_argument, NULL, 'l'},
+		{"stat",           optional_argument, NULL, 's'},
+		{"rule",           required_argument, NULL, 'r'},
+		{"pcap-threads",   required_argument, NULL, 1000},
+		{"direct-io",      no_argument,       NULL, 1001},
+		{"chunk-size",     required_argument, NULL, 1002},
+		{"only-headers",   no_argument,       NULL, 1003},
+		{"num-queues",     required_argument, NULL, 1004},
+		{"parallel-write", required_argument, NULL, 1005},
+		{"help",           no_argument,       NULL, 'h'},
 		{NULL, 0, NULL, 0}
 	};
-	int		code;
-	char   *pos;
+	int			code;
+	char	   *pos;
 
 	while ((code = getopt_long(argc, argv, "i:o:p:t:l:s::r:h",
 							   long_options, NULL)) >= 0)
@@ -1594,6 +1601,12 @@ parse_options(int argc, char *argv[])
 					Elog("invalid --num-queues argument: %s", optarg);
 				break;
 
+			case 1005:	/* --parallel-write */
+				arrow_file_desc_nums = strtol(optarg, &pos, 10);
+				if (*pos != '\0' || arrow_file_desc_nums < 1)
+					Elog("invalid --parallel-write argument: %s", optarg);
+				break;
+				
 			default:
 				usage(code == 'h' ? 0 : 1);
 				break;
@@ -1744,12 +1757,8 @@ arrowMergeChunkWriteOut(SQLtable *dchunk,
 		}
 	}
 
-	if (is_last_buddy)
-	{
-		if (dchunk->nitems > 0)
-			arrowChunkWriteOut(dchunk);
-		arrowCloseOutputFile(arrow_file_desc_current);
-	}
+	if (is_last_buddy && dchunk->nitems > 0)
+		arrowChunkWriteOut(dchunk);
 }
 
 static void
@@ -1900,11 +1909,6 @@ int main(int argc, char *argv[])
 		chunk->fdesc = -1;
 		arrow_chunks_array[i] = chunk;
 	}
-	/* open the output file, and misc init stuff */
-	arrow_file_desc_current = arrowOpenOutputFile();
-	pthreadMutexInit(&arrow_file_desc_lock);
-	if (sem_init(&pcap_worker_sem, 0, num_pcap_threads) != 0)
-		Elog("failed on sem_init: %m");
 
 	if (input_devname)
 	{
@@ -1998,6 +2002,17 @@ int main(int argc, char *argv[])
 		}
 	}
 
+	/* open the output files, and related initialization */
+	arrow_file_desc_locks = palloc0(sizeof(pthread_mutex_t) * arrow_file_desc_nums);
+	arrow_file_desc_array = palloc0(sizeof(arrowFileDesc *) * arrow_file_desc_nums);
+	for (i=0; i < arrow_file_desc_nums; i++)
+	{
+		pthreadMutexInit(&arrow_file_desc_locks[i]);
+		arrow_file_desc_array[i] = arrowOpenOutputFile();
+	}
+	if (sem_init(&pcap_worker_sem, 0, num_pcap_threads) != 0)
+		Elog("failed on sem_init: %m");
+	
 	/* ctrl-c handler */
 	signal(SIGINT, on_sigint_handler);
 	signal(SIGTERM, on_sigint_handler);
@@ -2035,6 +2050,9 @@ int main(int argc, char *argv[])
 								arrow_chunks_array[i],
 								i == num_threads - 1);
 	}
+	for (i=0; i < arrow_file_desc_nums; i++)
+		arrowCloseOutputFile(arrow_file_desc_array[i]);
+		
 	return 0;
 }
 
