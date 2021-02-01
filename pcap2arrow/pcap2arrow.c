@@ -1885,9 +1885,112 @@ pcap_print_stat(bool is_final_call)
 	last_pfring_stat		= curr_pfring_stat;
 }
 
-int main(int argc, char *argv[])
+/*
+ * init_pfring_device_input - open the network device using PF-RING
+ */
+static void
+init_pfring_input(void)
+{
+	uint32_t	cluster_id = (uint32_t)getpid();
+	int			i, rv;
+
+	pfring_desc_array = palloc0(sizeof(pfring *) * pfring_desc_nums);
+	for (i=0; i < pfring_desc_nums; i++)
+	{
+		pfring *pd;
+
+		pd = pfring_open(input_devname, 65536,
+						 PF_RING_REENTRANT |
+						 PF_RING_TIMESTAMP |
+						 PF_RING_PROMISC);
+		if (!pd)
+			Elog("failed on pfring_open: %m - "
+				 "pf_ring not loaded or interface %s is down?",
+				 input_devname);
+		rv = pfring_set_application_name(pd, "pcap2arrow");
+		if (rv)
+			Elog("failed on pfring_set_application_name");
+
+		//NOTE: Is rx_only_direction right?
+		rv = pfring_set_direction(pd, rx_only_direction);
+		if (rv)
+			Elog("failed on pfring_set_direction");
+
+		rv = pfring_set_poll_duration(pd, 50);
+		if (rv)
+			Elog("failed on pfring_set_poll_duration");
+
+		rv = pfring_set_socket_mode(pd, recv_only_mode);
+		if (rv)
+			Elog("failed on pfring_set_socket_mode");
+
+		if (bpf_filter_rule)
+		{
+			rv = pfring_set_bpf_filter(pd, bpf_filter_rule);
+			if (rv)
+				Elog("failed on pfring_set_bpf_filter");
+		}
+
+		rv = pfring_set_cluster(pd, cluster_id, cluster_round_robin);
+		if (rv)
+			Elog("failed on pfring_set_cluster");
+
+		rv = pfring_enable_ring(pd);
+		if (rv)
+			Elog("failed on pfring_enable_ring");
+
+		pfring_desc_array[i] = pd;
+	}
+}
+
+/*
+ * init_pcap_file_input
+ */
+static void
+init_pcap_file_input(void)
 {
 	struct stat	stat_buf;
+	int		i;
+		
+	/* Open the PCAP files */
+	Assert(pcap_file_desc_nums > 0);
+	for (i=0; i < pcap_file_desc_nums; i++)
+	{
+		pcapFileDesc *pcap = &pcap_file_desc_array[i];
+		struct pcap_file_header *pcap_head;
+		int			fdesc;
+
+		fdesc = open(pcap->pcap_filename, O_RDONLY);
+		if (fdesc < 0)
+			Elog("failed on open('%s'): %m", pcap->pcap_filename);
+		if (fstat(fdesc, &stat_buf) != 0)
+			Elog("failed on fstat('%s'): %m", pcap->pcap_filename);
+		pcap_head = mmap(NULL, stat_buf.st_size,
+						 PROT_READ,
+						 MAP_PRIVATE,
+						 fdesc, 0);
+		if (pcap_head != MAP_FAILED)
+			Elog("failed on mmap('%s', %zu): %m",
+				 pcap->pcap_filename,
+				 stat_buf.st_size);
+		close(fdesc);
+
+		if (pcap_head->magic != PCAP_MAGIC__HOST &&
+			pcap_head->magic != PCAP_MAGIC__SWAP &&
+			pcap_head->magic != PCAP_MAGIC__HOST_NS &&
+			pcap_head->magic != PCAP_MAGIC__SWAP_NS)
+			Elog("file '%s' may not have PCAP file format (magic: %08x)",
+				 pcap->pcap_filename, pcap_head->magic);
+
+		pcap->pcap_filemap = (char *)pcap_head;
+		pcap->pcap_file_sz = stat_buf.st_size;
+		pcap->pcap_file_magic = pcap_head->magic;
+		pcap->pcap_file_read_pos = sizeof(struct pcap_file_header);
+	}
+}
+
+int main(int argc, char *argv[])
+{
 	pthread_t  *workers;
 	long		i, rv;
 
@@ -1912,94 +2015,11 @@ int main(int argc, char *argv[])
 
 	if (input_devname)
 	{
-		/* Open the input device using PF-RING */
-		uint32_t	cluster_id = (uint32_t)getpid();
-
-		pfring_desc_array = palloc0(sizeof(pfring *) * pfring_desc_nums);
-		for (i=0; i < pfring_desc_nums; i++)
-		{
-			pfring *pd;
-
-			pd = pfring_open(input_devname, 65536,
-							 PF_RING_REENTRANT |
-							 PF_RING_TIMESTAMP |
-							 PF_RING_PROMISC);
-			if (!pd)
-				Elog("failed on pfring_open: %m - "
-					 "pf_ring not loaded or interface %s is down?",
-					 input_devname);
-			rv = pfring_set_application_name(pd, "pcap2arrow");
-			if (rv)
-				Elog("failed on pfring_set_application_name");
-
-			//NOTE: Is rx_only_direction right?
-			rv = pfring_set_direction(pd, rx_only_direction);
-			if (rv)
-				Elog("failed on pfring_set_direction");
-
-			rv = pfring_set_poll_duration(pd, 50);
-			if (rv)
-				Elog("failed on pfring_set_poll_duration");
-
-			rv = pfring_set_socket_mode(pd, recv_only_mode);
-			if (rv)
-				Elog("failed on pfring_set_socket_mode");
-
-			if (bpf_filter_rule)
-			{
-				rv = pfring_set_bpf_filter(pd, bpf_filter_rule);
-				if (rv)
-					Elog("failed on pfring_set_bpf_filter");
-			}
-
-			rv = pfring_set_cluster(pd, cluster_id, cluster_round_robin);
-			if (rv)
-				Elog("failed on pfring_set_cluster");
-
-			rv = pfring_enable_ring(pd);
-			if (rv)
-				Elog("failed on pfring_enable_ring");
-
-			pfring_desc_array[i] = pd;
-		}
+		init_pfring_input();
 	}
 	else
 	{
-		/* Open the PCAP files */
-		Assert(pcap_file_desc_nums > 0);
-		for (i=0; i < pcap_file_desc_nums; i++)
-		{
-			pcapFileDesc *pcap = &pcap_file_desc_array[i];
-			struct pcap_file_header *pcap_head;
-			int			fdesc;
-
-			fdesc = open(pcap->pcap_filename, O_RDONLY);
-			if (fdesc < 0)
-				Elog("failed on open('%s'): %m", pcap->pcap_filename);
-			if (fstat(fdesc, &stat_buf) != 0)
-				Elog("failed on fstat('%s'): %m", pcap->pcap_filename);
-			pcap_head = mmap(NULL, stat_buf.st_size,
-							 PROT_READ,
-							 MAP_PRIVATE,
-							 fdesc, 0);
-			if (pcap_head != MAP_FAILED)
-				Elog("failed on mmap('%s', %zu): %m",
-					 pcap->pcap_filename,
-					 stat_buf.st_size);
-			close(fdesc);
-
-			if (pcap_head->magic != PCAP_MAGIC__HOST &&
-				pcap_head->magic != PCAP_MAGIC__SWAP &&
-				pcap_head->magic != PCAP_MAGIC__HOST_NS &&
-				pcap_head->magic != PCAP_MAGIC__SWAP_NS)
-				Elog("file '%s' may not have PCAP file format (magic: %08x)",
-					 pcap->pcap_filename, pcap_head->magic);
-
-			pcap->pcap_filemap = (char *)pcap_head;
-			pcap->pcap_file_sz = stat_buf.st_size;
-			pcap->pcap_file_magic = pcap_head->magic;
-			pcap->pcap_file_read_pos = sizeof(struct pcap_file_header);
-		}
+		init_pcap_file_input();
 	}
 
 	/* open the output files, and related initialization */
