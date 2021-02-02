@@ -85,12 +85,14 @@ static uint64_t			arrow_file_desc_selector = 0;
 static int				arrow_file_desc_nums = 1;
 
 /* static variables for worker threads */
-//static pthread_mutex_t *arrow_workers_blocker;	/* per-thread blocker mutex */
 static pthread_mutex_t	arrow_workers_mutex;
 static pthread_cond_t	arrow_workers_cond;
 static bool			   *arrow_workers_completed;
-static SQLtable		  **arrow_chunks_array;		/* per-thread buffer */
+static SQLtable		  **arrow_chunks_array;			/* chunk buffer per-thread */
 static sem_t			pcap_worker_sem;
+#ifndef DIRECT_IO_ALIGN
+#define DIRECT_IO_ALIGN(x)		(((x) + 511UL) & ~511UL)
+#endif /* DIRECT_IO_ALIGN */
 
 /* static variable for PF-RING capture mode */
 static pfring		  **pfring_desc_array = NULL;
@@ -129,6 +131,10 @@ static long				PAGESIZE;
 static long				NCPUS;
 static __thread long	worker_id = -1;
 static volatile bool	do_shutdown = false;
+#ifndef PAGE_ALIGN
+#define PAGE_ALIGN(x)	(((x) + PAGESIZE - 1) & ~(PAGESIZE - 1))
+#endif /* PAGE_ALIGN */
+
 
 #if __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
 #define __ntoh16(x)		__builtin_bswap16(x)
@@ -1026,7 +1032,7 @@ arrowOpenOutputFile(void)
 	char	   *path, *pos;
 	int			off, sz = 256;
 	int			retry_count = 0;
-	int			fdesc, flags;
+	int			fdesc;
 	arrowFileDesc *outfd;
 
 	/* build a filename */
@@ -1096,10 +1102,7 @@ retry:
 	} while (off >= sz);
 
 	/* open file */
-	flags = O_RDWR | O_CREAT | O_EXCL;
-	if (enable_direct_io)
-		flags |= O_DIRECT;
-	fdesc = open(path, flags, 0644);
+	fdesc = open(path, O_RDWR | O_CREAT | O_EXCL, 0644);
 	if (fdesc < 0)
 	{
 		if (errno == EEXIST)
@@ -1122,6 +1125,16 @@ retry:
 	arrowFileWrite(&outfd->table, "ARROW1\0\0", 8);
 	writeArrowSchema(&outfd->table);
 
+	/* Turn on O_DIRECT if --direct-io is given */
+	if (enable_direct_io)
+	{
+		int		flags = fcntl(fdesc, F_GETFD);
+
+		flags |= O_DIRECT;
+		if (fcntl(fdesc, F_SETFD, &flags) != 0)
+			Elog("failed on fcntl('%s', F_SETFD, O_DIRECT): %m", path);
+		outfd->table.f_pos = DIRECT_IO_ALIGN(outfd->table.f_pos);
+	}
 	return outfd;
 }
 
@@ -1138,11 +1151,74 @@ arrowCloseOutputFile(arrowFileDesc *outfd)
 	}
 	else
 	{
+		/* turn off direct-io, if O_DIRECT is set */
+		if (enable_direct_io)
+		{
+			int		flags = fcntl(outfd->table.fdesc, F_GETFD);
+
+			flags &= ~O_DIRECT;
+			if (fcntl(outfd->table.fdesc, F_SETFD, flags) != 0)
+				Elog("failed on fcntl('%s', F_SETFD, %d): %m",
+					 outfd->table.filename, flags);
+		}
 		if (lseek(outfd->table.fdesc, outfd->table.f_pos, SEEK_SET) < 0)
 			Elog("failed on lseek('%s'): %m", outfd->table.filename);
 		writeArrowFooter(&outfd->table);
 	}
 	close(outfd->table.fdesc);
+}
+
+/*
+ * arrowFileDirectWriteIOV
+ */
+static void
+arrowFileDirectWriteIOV(SQLtable *chunk, size_t length)
+{
+	static __thread char   *dio_buffer = NULL;
+	static __thread size_t	dio_buffer_sz = 0;
+	char	   *pos;
+	int			i, gap;
+
+	Assert(length == DIRECT_IO_ALIGN(length));
+	/* DIO buffer allocation on the demand */
+	if (!dio_buffer)
+	{
+		dio_buffer_sz = PAGE_ALIGN(length) + (1UL << 21);	/* 2MB margin */
+		dio_buffer = mmap(NULL, dio_buffer_sz,
+						  PROT_READ | PROT_WRITE,
+						  MAP_PRIVATE | MAP_ANONYMOUS,
+						  -1, 0);
+		if (dio_buffer == MAP_FAILED)
+			Elog("failed on mmap(sz=%zu): %m", dio_buffer_sz);
+	}
+	else if (length > dio_buffer_sz)
+	{
+		size_t		sz = PAGE_ALIGN(length) + (1UL << 21);	/* 2MB margin */
+
+		dio_buffer = mremap(dio_buffer, dio_buffer_sz, sz, MREMAP_MAYMOVE);
+		if (dio_buffer == MAP_FAILED)
+			Elog("failed on mremap(sz=%zu -> %zu): %m", dio_buffer_sz, sz);
+		dio_buffer_sz = sz;
+	}
+
+	/* setup DIO buffer */
+	pos = dio_buffer;
+	for (i=0; i < chunk->__iov_cnt; i++)
+	{
+		struct iovec *iov = &chunk->__iov[i];
+
+		memcpy(pos, iov->iov_base, iov->iov_len);
+		pos += iov->iov_len;
+	}
+	Assert(pos <= dio_buffer + length);
+	gap = (dio_buffer + length) - pos;
+	if (gap > 0)
+		memset(pos, 0, gap);
+
+	/* issue direct i/o */
+	arrowFileWrite(chunk, dio_buffer, length);
+
+	chunk->__iov_cnt = 0;	/* rewind iovec */
 }
 
 /*
@@ -1163,7 +1239,9 @@ arrowChunkWriteOut(SQLtable *chunk)
 	 */
 	Assert(chunk->fdesc < 0);
 	length = setupArrowRecordBatchIOV(chunk);
-	
+	if (enable_direct_io)
+		length = DIRECT_IO_ALIGN(length);
+
 	/*
 	 * attach file descriptor
 	 */
@@ -1209,7 +1287,20 @@ arrowChunkWriteOut(SQLtable *chunk)
 	block.metaDataLength = meta_sz;
 	block.bodyLength = length - meta_sz;
 
-	arrowFileWriteIOV(chunk);
+#if 1
+	if (!enable_direct_io)
+	{
+		/* write-out using pwritev */
+		arrowFileWriteIOV(chunk);
+	}
+	else
+	{
+		/* write-out by direct-io */
+		arrowFileDirectWriteIOV(chunk, length);
+	}
+#else
+	chunk->__iov_cnt = 0;
+#endif
 
 	/*
 	 * Ok, append ArrowBlock and detach file descriptor
