@@ -1128,11 +1128,11 @@ retry:
 	/* Turn on O_DIRECT if --direct-io is given */
 	if (enable_direct_io)
 	{
-		int		flags = fcntl(fdesc, F_GETFD);
+		int		flags = fcntl(fdesc, F_GETFL);
 
 		flags |= O_DIRECT;
-		if (fcntl(fdesc, F_SETFD, &flags) != 0)
-			Elog("failed on fcntl('%s', F_SETFD, O_DIRECT): %m", path);
+		if (fcntl(fdesc, F_SETFL, &flags) != 0)
+			Elog("failed on fcntl('%s', F_SETFL, O_DIRECT): %m", path);
 		outfd->table.f_pos = DIRECT_IO_ALIGN(outfd->table.f_pos);
 	}
 	return outfd;
@@ -1154,11 +1154,11 @@ arrowCloseOutputFile(arrowFileDesc *outfd)
 		/* turn off direct-io, if O_DIRECT is set */
 		if (enable_direct_io)
 		{
-			int		flags = fcntl(outfd->table.fdesc, F_GETFD);
+			int		flags = fcntl(outfd->table.fdesc, F_GETFL);
 
 			flags &= ~O_DIRECT;
-			if (fcntl(outfd->table.fdesc, F_SETFD, flags) != 0)
-				Elog("failed on fcntl('%s', F_SETFD, %d): %m",
+			if (fcntl(outfd->table.fdesc, F_SETFL, flags) != 0)
+				Elog("failed on fcntl('%s', F_SETFL, %d): %m",
 					 outfd->table.filename, flags);
 		}
 		if (lseek(outfd->table.fdesc, outfd->table.f_pos, SEEK_SET) < 0)
@@ -1287,7 +1287,6 @@ arrowChunkWriteOut(SQLtable *chunk)
 	block.metaDataLength = meta_sz;
 	block.bodyLength = length - meta_sz;
 
-#if 1
 	if (!enable_direct_io)
 	{
 		/* write-out using pwritev */
@@ -1298,9 +1297,6 @@ arrowChunkWriteOut(SQLtable *chunk)
 		/* write-out by direct-io */
 		arrowFileDirectWriteIOV(chunk, length);
 	}
-#else
-	chunk->__iov_cnt = 0;
-#endif
 
 	/*
 	 * Ok, append ArrowBlock and detach file descriptor
