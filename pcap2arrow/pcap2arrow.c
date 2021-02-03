@@ -53,31 +53,31 @@
 #define PCAP_SWITCH__PER_MONTH		5
 
 /* command-line options */
-static char		   *input_devname = NULL;
-static char		   *output_filename = "/tmp/pcap_%i_%y%m%d_%H%M%S.arrow";
-static int			protocol_mask = PCAP_PROTO__DEFAULT;
-static int			num_threads = -1;
-static int			num_pcap_threads = -1;
-static char		   *bpf_filter_rule = NULL;
-static size_t		output_filesize_limit = ULONG_MAX;			/* No Limit */
-static size_t		record_batch_threshold = (128UL << 20);		/* 128MB */
-static bool			enable_direct_io = false;
-static bool			only_headers = false;
-static int			print_stat_interval = -1;
+static char			   *input_devname = NULL;
+static char			   *output_filename = "/tmp/pcap_%i_%y%m%d_%H%M%S.arrow";
+static int				protocol_mask = PCAP_PROTO__DEFAULT;
+static int				num_threads = -1;
+static int				num_pcap_threads = -1;
+static char			   *bpf_filter_rule = NULL;
+static size_t			output_filesize_limit = ULONG_MAX;			/* No Limit */
+static size_t			record_batch_threshold = (128UL << 20);		/* 128MB */
+static bool				enable_direct_io = false;
+static bool				only_headers = false;
+static int				print_stat_interval = -1;
 
 /*
  * definition of output Arrow files
  */
 typedef struct
 {
-	int				refcnt;
-	SQLtable		table;
+	int					refcnt;
+	SQLtable			table;
 } arrowFileDesc;
 #define PCAP_SCHEMA_MAX_NFIELDS		50
 
-#define MACADDR_LEN			6
-#define IP4ADDR_LEN			4
-#define IP6ADDR_LEN			16
+#define MACADDR_LEN		6
+#define IP4ADDR_LEN		4
+#define IP6ADDR_LEN		16
 
 static pthread_mutex_t *arrow_file_desc_locks;
 static arrowFileDesc  **arrow_file_desc_array = NULL;
@@ -107,24 +107,24 @@ static int				pfring_desc_nums = -1;
 
 typedef struct
 {
-	const char	   *pcap_filename;
-	char		   *pcap_filemap;
-	size_t			pcap_file_sz;
-	uint32_t		pcap_file_magic;
-	volatile off_t	pcap_file_read_pos;
+	int					pcap_worker_id;
+	pcap_t			   *pcap_handle;
+	FILE			   *pcap_filp;
+	const char		   *pcap_filename;
+	char				pcap_errbuf[PCAP_ERRBUF_SIZE];
 } pcapFileDesc;
 
-static pcapFileDesc		   *pcap_file_desc_array = NULL;
-static volatile int			pcap_file_desc_index = 0;
-static int					pcap_file_desc_nums = 0;
+static pcapFileDesc	   *pcap_file_desc_array = NULL;
+static volatile int		pcap_file_desc_selector = 0;
+static int				pcap_file_desc_nums = 0;
 
 /* capture statistics */
-static uint64_t		stat_raw_packet_length = 0;
-static uint64_t		stat_ip4_packet_count = 0;
-static uint64_t		stat_ip6_packet_count = 0;
-static uint64_t		stat_tcp_packet_count = 0;
-static uint64_t		stat_udp_packet_count = 0;
-static uint64_t		stat_icmp_packet_count = 0;
+static uint64_t			stat_raw_packet_length = 0;
+static uint64_t			stat_ip4_packet_count = 0;
+static uint64_t			stat_ip6_packet_count = 0;
+static uint64_t			stat_tcp_packet_count = 0;
+static uint64_t			stat_udp_packet_count = 0;
+static uint64_t			stat_icmp_packet_count = 0;
 
 /* other static variables */
 static long				PAGESIZE;
@@ -258,21 +258,6 @@ __put_inline_null_value(SQLfield *column, size_t index, int sz)
 	sql_buffer_append_zero(&column->values, sz);
 }
 
-static inline size_t
-__put_uint_value_common(SQLfield *column, const char *addr, int sz)
-{
-	size_t		index = column->nitems++;
-
-	if (!addr)
-		__put_inline_null_value(column, index, sz);
-	else
-	{
-		sql_buffer_setbit(&column->nullmap, index);
-		sql_buffer_append(&column->values, addr, sz);
-	}
-	return __buffer_usage_inline_type(column);
-}
-
 static size_t
 put_uint8_value(SQLfield *column, const char *addr, int sz)
 {
@@ -348,7 +333,7 @@ put_uint32_value_bswap(SQLfield *column, const char *addr, int sz)
 
 	Assert(!addr || sz == sizeof(uint32_t));
 	if (!addr)
-		__put_inline_null_value(column, index, sizeof(uint16_t));
+		__put_inline_null_value(column, index, sizeof(uint32_t));
 	else
 	{
 		uint32_t	value = __ntoh32(*((uint32_t *)addr));
@@ -754,10 +739,10 @@ arrowPcapSchemaInit(SQLtable *table)
 /*
  * handlePacketRawEthernet
  */
-static u_char *
+static const u_char *
 handlePacketRawEthernet(SQLtable *chunk,
 						struct pfring_pkthdr *hdr,
-						u_char *buf, uint16_t *p_ether_type)
+						const u_char *buf, uint16_t *p_ether_type)
 {
 	__FIELD_PUT_VALUE_DECL;
 	struct __raw_ether {
@@ -787,9 +772,9 @@ handlePacketRawEthernet(SQLtable *chunk,
 /*
  * handlePacketIPv4Header
  */
-static u_char *
+static const u_char *
 handlePacketIPv4Header(SQLtable *chunk,
-					   u_char *buf, size_t sz, uint8_t *p_proto)
+					   const u_char *buf, size_t sz, uint8_t *p_proto)
 {
 	__FIELD_PUT_VALUE_DECL;
 	struct __ipv4_head {
@@ -858,9 +843,9 @@ fillup_by_null:
 /*
  * handlePacketIPv6Header
  */
-static u_char *
+static const u_char *
 handlePacketIPv6Header(SQLtable *chunk,
-					   u_char *buf, size_t sz, uint8_t *p_proto)
+					   const u_char *buf, size_t sz, uint8_t *p_proto)
 {
 	Elog("handlePacketIPv6Header not implemented yet");
 	return NULL;
@@ -869,9 +854,9 @@ handlePacketIPv6Header(SQLtable *chunk,
 /*
  * handlePacketTcpHeader
  */
-static u_char *
+static const u_char *
 handlePacketTcpHeader(SQLtable *chunk,
-					  u_char *buf, size_t sz, int proto)
+					  const u_char *buf, size_t sz, int proto)
 {
 	__FIELD_PUT_VALUE_DECL;
 	struct __tcp_head {
@@ -933,9 +918,9 @@ fillup_by_null:
 /*
  * handlePacketUdpHeader
  */
-static u_char *
+static const u_char *
 handlePacketUdpHeader(SQLtable *chunk,
-					  u_char *buf, size_t sz, int proto)
+					  const u_char *buf, size_t sz, int proto)
 {
 	__FIELD_PUT_VALUE_DECL;
 	struct __udp_head {
@@ -973,9 +958,9 @@ fillup_by_null:
 /*
  * handlePacketIcmpHeader
  */
-static u_char *
+static const u_char *
 handlePacketIcmpHeader(SQLtable *chunk,
-					   u_char *buf, size_t sz, int proto)
+					   const u_char *buf, size_t sz, int proto)
 {
 	__FIELD_PUT_VALUE_DECL;
 	struct __icmp_head {
@@ -1005,7 +990,7 @@ fillup_by_null:
  * handlePacketPayload
  */
 static void
-handlePacketPayload(SQLtable *chunk, u_char *buf, size_t sz)
+handlePacketPayload(SQLtable *chunk, const u_char *buf, size_t sz)
 {
 	__FIELD_PUT_VALUE_DECL;
 	
@@ -1051,7 +1036,9 @@ retry:
 				{
 					case 'i':
 						off += snprintf(path+off, sz-off,
-										"%s", input_devname);
+										"%s", (input_devname ?
+											   input_devname : "file"));
+
 						break;
 					case 'Y':
 						off += snprintf(path+off, sz-off,
@@ -1345,7 +1332,8 @@ __arrowMergeChunkOneRow(SQLtable *dchunk,
 		struct timeval ts_buf;
 
 		Assert(schunk->nitems == scolumn->nitems);
-		if ((scolumn->nullmap.data[index>>3] & (1<<(index&7))) == 0)
+		if (scolumn->nullcount > 0 &&
+			(scolumn->nullmap.data[index>>3] & (1<<(index&7))) == 0)
 		{
 			usage += dcolumn->put_value(dcolumn, NULL, 0);
 			continue;
@@ -1417,12 +1405,12 @@ arrowMergeChunkWriteOut(SQLtable *dchunk, SQLtable *schunk)
  */
 static inline void
 __execCaptureOnePacket(SQLtable *chunk,
-					   struct pfring_pkthdr *hdr, u_char *pos)
+					   struct pfring_pkthdr *hdr, const u_char *pos)
 {
-	u_char	   *end = pos + hdr->caplen;
-	u_char	   *next;
-	uint16_t	ether_type;
-	uint8_t		proto;
+	const u_char   *end = pos + hdr->caplen;
+	const u_char   *next;
+	uint16_t		ether_type;
+	uint8_t			proto;
 
 	pos = handlePacketRawEthernet(chunk, hdr, pos, &ether_type);
 	if (!pos)
@@ -1437,10 +1425,9 @@ __execCaptureOnePacket(SQLtable *chunk,
 
 		if ((protocol_mask & __PCAP_PROTO__IPv4) == 0)
 			goto fillup_by_null;
-
 		next = handlePacketIPv4Header(chunk, pos, end - pos, &proto);
-		if (!next)
-			goto fillup_by_null;
+		if (next)
+			pos = next;
 		pos = next;
 		if ((protocol_mask & __PCAP_PROTO__IPv6) != 0)
 			handlePacketIPv6Header(chunk, NULL, 0, NULL);
@@ -1453,9 +1440,8 @@ __execCaptureOnePacket(SQLtable *chunk,
 		if ((protocol_mask & __PCAP_PROTO__IPv6) == 0)
 			goto fillup_by_null;
 		next = handlePacketIPv6Header(chunk, pos, end - pos, &proto);
-		if (!next)
-			goto fillup_by_null;
-		pos = next;
+		if (next)
+			pos = next;
 		if ((protocol_mask & __PCAP_PROTO__IPv4) != 0)
 			handlePacketIPv4Header(chunk, NULL, 0, NULL);
 	}
@@ -1472,9 +1458,8 @@ __execCaptureOnePacket(SQLtable *chunk,
 			atomicAdd64(&stat_tcp_packet_count, 1);
 
 		next = handlePacketTcpHeader(chunk, pos, end - pos, proto);
-		if (!next)
-			handlePacketTcpHeader(chunk, NULL, 0, -1);
-		pos = next;
+		if (next)
+			pos = next;
 	}
 	else
 	{
@@ -1488,9 +1473,8 @@ __execCaptureOnePacket(SQLtable *chunk,
 			atomicAdd64(&stat_udp_packet_count, 1);
 
 		next = handlePacketUdpHeader(chunk, pos, end - pos, proto);
-		if (!next)
-			handlePacketUdpHeader(chunk, NULL, 0, 0xff);
-		pos = next;
+		if (next)
+			pos = next;
 	}
 	else
 	{
@@ -1504,9 +1488,8 @@ __execCaptureOnePacket(SQLtable *chunk,
 			atomicAdd64(&stat_icmp_packet_count, 1);
 
 		next = handlePacketIcmpHeader(chunk, pos, end - pos, proto);
-		if (!next)
-			handlePacketIcmpHeader(chunk, NULL, 0, 0xff);
-		pos = next;
+		if (next)
+			pos = next;
 	}
 	else
 	{
@@ -1563,14 +1546,50 @@ execCapturePackets(pfring *pd, SQLtable *chunk)
 }
 
 /*
- * pcap_worker_main
+ * final_merge_pending_chunks
  */
 static void *
-pcap_worker_main(void *__arg)
+final_merge_pending_chunks(SQLtable *chunk)
+{
+	int		phase;
+
+	Assert(worker_id >= 0 && worker_id < num_threads);
+	/* merge pending chunks */
+	for (phase = 0; (worker_id & ((1UL << (phase + 1)) - 1)) == 0; phase++)
+	{
+		int		buddy = worker_id + (1UL << phase);
+
+		if (buddy >= num_threads)
+			break;
+		pthreadMutexLock(&arrow_workers_mutex);
+		while (!arrow_workers_completed[buddy])
+		{
+			pthreadCondWait(&arrow_workers_cond,
+							&arrow_workers_mutex);
+		}
+		pthreadMutexUnlock(&arrow_workers_mutex);
+
+		arrowMergeChunkWriteOut(chunk, arrow_chunks_array[buddy]);
+	}
+	if (worker_id == 0 && chunk->nitems > 0)
+		arrowChunkWriteOut(chunk);
+	
+	/* Ok, this worker exit */
+	pthreadMutexLock(&arrow_workers_mutex);
+	arrow_workers_completed[worker_id] = true;
+	pthreadCondBroadcast(&arrow_workers_cond);
+	pthreadMutexUnlock(&arrow_workers_mutex);
+
+	return NULL;
+}
+
+/*
+ * pfring_worker_main
+ */
+static void *
+pfring_worker_main(void *__arg)
 {
 	SQLtable   *chunk;
-	int			phase;
-	int			buddy;
 
 	/* assign worker-id of this thread */
 	worker_id = (long)__arg;
@@ -1606,33 +1625,55 @@ pcap_worker_main(void *__arg)
 		if (status > 0)
 			arrowChunkWriteOut(chunk);
 	}
-	/* merge pending chunks */
-	for (phase = 0; (worker_id & ((1UL << (phase + 1)) - 1)) == 0; phase++)
-	{
-		buddy = worker_id + (1UL << phase);
+	return final_merge_pending_chunks(chunk);
+}
 
-		if (buddy >= num_threads)
-			break;
-		pthreadMutexLock(&arrow_workers_mutex);
-		while (!arrow_workers_completed[buddy])
-		{
-			pthreadCondWait(&arrow_workers_cond,
-							&arrow_workers_mutex);
-		}
-		pthreadMutexUnlock(&arrow_workers_mutex);
-
-		arrowMergeChunkWriteOut(chunk, arrow_chunks_array[buddy]);
-	}
-	if (worker_id == 0 && chunk->nitems > 0)
-		arrowChunkWriteOut(chunk);
+/*
+ * pcap_file_worker_main
+ */
+static void *
+pcap_file_worker_main(void *__arg)
+{
+	SQLtable   *chunk;
+	int			i;
 	
-	/* Ok, this worker exit */
-	pthreadMutexLock(&arrow_workers_mutex);
-	arrow_workers_completed[worker_id] = true;
-	pthreadCondBroadcast(&arrow_workers_cond);
-	pthreadMutexUnlock(&arrow_workers_mutex);
+	/* assign worker-id of this thread */
+	worker_id = (long)__arg;
+	chunk = arrow_chunks_array[worker_id];
 
-	return NULL;
+	for (i = worker_id;
+		 i < pcap_file_desc_nums && !do_shutdown;
+		 i += num_threads)
+	{
+		pcapFileDesc   *pfdesc = &pcap_file_desc_array[i];
+		const u_char   *buffer;
+
+		pfdesc->pcap_handle =
+			pcap_fopen_offline_with_tstamp_precision(pfdesc->pcap_filp,
+													 PCAP_TSTAMP_PRECISION_MICRO,
+													 pfdesc->pcap_errbuf);
+		for (;;)
+		{
+			struct pcap_pkthdr hdr;
+			struct pfring_pkthdr __hdr;
+
+			buffer = pcap_next(pfdesc->pcap_handle, &hdr);
+			if (!buffer)
+				break;
+			__hdr.ts = hdr.ts;
+			__hdr.caplen = hdr.caplen;
+			__hdr.len = hdr.len;
+			__execCaptureOnePacket(chunk, &__hdr, buffer);
+			if (chunk->usage >= record_batch_threshold)
+			{
+				arrowChunkWriteOut(chunk);
+				sql_table_clear(chunk);
+			}
+		}
+		/* close */
+		pcap_close(pfdesc->pcap_handle);
+    }
+	return final_merge_pending_chunks(chunk);
 }
 
 /*
@@ -1694,7 +1735,7 @@ parse_options(int argc, char *argv[])
 		{"protocol",       required_argument, NULL, 'p'},
 		{"threads",        required_argument, NULL, 't'},
 		{"limit",          required_argument, NULL, 'l'},
-		{"stat",           optional_argument, NULL, 's'},
+		{"stat",           required_argument, NULL, 's'},
 		{"rule",           required_argument, NULL, 'r'},
 		{"pcap-threads",   required_argument, NULL, 1000},
 		{"direct-io",      no_argument,       NULL, 1001},
@@ -1783,16 +1824,11 @@ parse_options(int argc, char *argv[])
 				break;
 
 			case 's':	/* stat */
-				if (!optarg)
-					print_stat_interval = 2;	/* 2s interval */
-				else
-				{
-					print_stat_interval = strtol(optarg, &pos, 10);
-					if (*pos != '\0')
-						Elog("invalid -s|--stat argument [%s]", optarg);
-					if (print_stat_interval <= 0)
-						Elog("invalid interval to print statistics [%s]", optarg);
-				}
+				print_stat_interval = strtol(optarg, &pos, 10);
+				if (*pos != '\0')
+					Elog("invalid -s|--stat argument [%s]", optarg);
+				if (print_stat_interval <= 0)
+					Elog("invalid interval to print statistics [%s]", optarg);
 				break;
 
 			case 1000:	/* pcap-threads */
@@ -1837,29 +1873,49 @@ parse_options(int argc, char *argv[])
 				break;
 				
 			default:
+				printf("code = '%c'\n", code);
 				usage(code == 'h' ? 0 : 1);
 				break;
 		}
 	}
 
-	if (argc == optind + 1)
+	if (input_devname)
 	{
-		if (!input_devname)
-			Elog("neither input device nor PCAP files were not given");
+		printf("argc=%d optind=%d\n", argc, optind);
+		if (argc != optind)
+			Elog("cannot use input device and PCAP files together");
 	}
-	else
+	else if (optind < argc)
 	{
 		int		i, nfiles = argc - optind;
-
-		if (input_devname)
-			Elog("cannot use input device and PCAP file simultaneously %d %d", argc, optind);
 
 		pcap_file_desc_array = palloc0(sizeof(pcapFileDesc) * nfiles);
 		for (i=0; i < nfiles; i++)
 		{
-			pcap_file_desc_array[i].pcap_filename = pstrdup(argv[optind + i]);
+			pcapFileDesc   *pfdesc = &pcap_file_desc_array[i];
+			const char	   *filename = argv[optind + i];
+			FILE		   *filp;
+
+			filp = fopen(filename, "rb");
+			if (!filp)
+				Elog("failed to open '%s': %m", filename);
+			pfdesc->pcap_worker_id = i;
+			pfdesc->pcap_filp = filp;
+			pfdesc->pcap_filename = pstrdup(filename);
 		}
 		pcap_file_desc_nums = nfiles;
+	}
+	else
+	{
+		/* input from stdin... */
+		pcapFileDesc   *pfdesc = palloc0(sizeof(pcapFileDesc));
+
+		pfdesc->pcap_worker_id = 0;
+		pfdesc->pcap_filp = stdin;
+		pfdesc->pcap_filename = "/dev/stdin";
+
+		pcap_file_desc_nums = 1;
+		pcap_file_desc_array = pfdesc;
 	}
 
 	for (pos = output_filename; *pos != '\0'; pos++)
@@ -1887,14 +1943,30 @@ parse_options(int argc, char *argv[])
 			}
 		}
 	}
-	if (num_threads < 0)
-		num_threads = 2 * NCPUS;
-	if (num_pcap_threads < 0)
-		num_pcap_threads = NCPUS;
-	if (pfring_desc_nums < 0)
-		pfring_desc_nums = (num_threads > 24 ? num_threads / 6 : 4);
-	if (!input_devname && print_stat_interval > 0)
-		Elog("-s|--stat option must be used with -i|--input=DEV option");
+
+	/*
+	 * number of threads have different default; depending on the input
+	 */
+	if (input_devname)
+	{
+		if (num_threads < 0)
+			num_threads = 2 * NCPUS;
+		if (num_pcap_threads < 0)
+			num_pcap_threads = NCPUS;
+		if (pfring_desc_nums < 0)
+			pfring_desc_nums = (num_threads > 24 ? num_threads / 6 : 4);
+	}
+	else
+	{
+		if (num_threads < 0)
+			num_threads = pcap_file_desc_nums;
+		if (num_pcap_threads >= 0)
+			Elog("--pcap-threads cannot be used with PCAP input files");
+		if (pfring_desc_nums >= 0)
+			Elog("--num-queues cannot be used with PCAP input files");
+		if (print_stat_interval > 0)
+			Elog("-s|--stat should be used with -i|--input=DEV option");
+	}
 }
 
 static void
@@ -2079,52 +2151,6 @@ init_pfring_input(void)
 	}
 }
 
-/*
- * init_pcap_file_input
- */
-static void
-init_pcap_file_input(void)
-{
-	struct stat	stat_buf;
-	int		i;
-		
-	/* Open the PCAP files */
-	Assert(pcap_file_desc_nums > 0);
-	for (i=0; i < pcap_file_desc_nums; i++)
-	{
-		pcapFileDesc *pcap = &pcap_file_desc_array[i];
-		struct pcap_file_header *pcap_head;
-		int			fdesc;
-
-		fdesc = open(pcap->pcap_filename, O_RDONLY);
-		if (fdesc < 0)
-			Elog("failed on open('%s'): %m", pcap->pcap_filename);
-		if (fstat(fdesc, &stat_buf) != 0)
-			Elog("failed on fstat('%s'): %m", pcap->pcap_filename);
-		pcap_head = mmap(NULL, stat_buf.st_size,
-						 PROT_READ,
-						 MAP_PRIVATE,
-						 fdesc, 0);
-		if (pcap_head != MAP_FAILED)
-			Elog("failed on mmap('%s', %zu): %m",
-				 pcap->pcap_filename,
-				 stat_buf.st_size);
-		close(fdesc);
-
-		if (pcap_head->magic != PCAP_MAGIC__HOST &&
-			pcap_head->magic != PCAP_MAGIC__SWAP &&
-			pcap_head->magic != PCAP_MAGIC__HOST_NS &&
-			pcap_head->magic != PCAP_MAGIC__SWAP_NS)
-			Elog("file '%s' may not have PCAP file format (magic: %08x)",
-				 pcap->pcap_filename, pcap_head->magic);
-
-		pcap->pcap_filemap = (char *)pcap_head;
-		pcap->pcap_file_sz = stat_buf.st_size;
-		pcap->pcap_file_magic = pcap_head->magic;
-		pcap->pcap_file_read_pos = sizeof(struct pcap_file_header);
-	}
-}
-
 int main(int argc, char *argv[])
 {
 	pthread_t  *workers;
@@ -2150,13 +2176,7 @@ int main(int argc, char *argv[])
 	}
 
 	if (input_devname)
-	{
 		init_pfring_input();
-	}
-	else
-	{
-		init_pcap_file_input();
-	}
 
 	/* open the output files, and related initialization */
 	arrow_file_desc_locks = palloc0(sizeof(pthread_mutex_t) * arrow_file_desc_nums);
@@ -2166,9 +2186,12 @@ int main(int argc, char *argv[])
 		pthreadMutexInit(&arrow_file_desc_locks[i]);
 		arrow_file_desc_array[i] = arrowOpenOutputFile();
 	}
-	if (sem_init(&pcap_worker_sem, 0, num_pcap_threads) != 0)
-		Elog("failed on sem_init: %m");
-	
+
+	if (num_pcap_threads >= 0)
+	{
+		if (sem_init(&pcap_worker_sem, 0, num_pcap_threads) != 0)
+			Elog("failed on sem_init: %m");
+	}
 	/* ctrl-c handler */
 	signal(SIGINT, on_sigint_handler);
 	signal(SIGTERM, on_sigint_handler);
@@ -2181,7 +2204,10 @@ int main(int argc, char *argv[])
 	workers = alloca(sizeof(pthread_t) * num_threads);
 	for (i=0; i < num_threads; i++)
 	{
-		rv = pthread_create(&workers[i], NULL, pcap_worker_main, (void *)i);
+		rv = pthread_create(&workers[i], NULL,
+							input_devname ?
+							pfring_worker_main :
+							pcap_file_worker_main, (void *)i);
 		if (rv != 0)
 			Elog("failed on pthread_create: %s", strerror(rv));
 	}
