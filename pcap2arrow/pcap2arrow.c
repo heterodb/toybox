@@ -61,6 +61,7 @@ static int				num_pcap_threads = -1;
 static char			   *bpf_filter_rule = NULL;
 static size_t			output_filesize_limit = ULONG_MAX;			/* No Limit */
 static size_t			record_batch_threshold = (128UL << 20);		/* 128MB */
+static bool				force_overwrite = false;
 static bool				enable_direct_io = false;
 static bool				only_headers = false;
 static int				print_stat_interval = -1;
@@ -1018,6 +1019,7 @@ arrowOpenOutputFile(void)
 	int			off, sz = 256;
 	int			retry_count = 0;
 	int			fdesc;
+	int			flags;
 	arrowFileDesc *outfd;
 
 	/* build a filename */
@@ -1089,7 +1091,11 @@ retry:
 	} while (off >= sz);
 
 	/* open file */
-	fdesc = open(path, O_RDWR | O_CREAT | O_EXCL, 0644);
+	flags = O_RDWR | O_CREAT;
+	if (!force_overwrite)
+		flags |= O_EXCL;
+
+	fdesc = open(path, flags, 0644);
 	if (fdesc < 0)
 	{
 		if (errno == EEXIST)
@@ -1687,6 +1693,7 @@ usage(int status)
 		  "OPTIONS:\n"
 		  "  -i|--input=DEVICE\n"
 		  "       specifies a network device to capture packet.\n"
+		  "     --num-queues=<N_QUEUE> : num of PF-RING queues.\n"
 		  "  -o|--output=<output file; with format>\n"
 		  "       filename format can contains:"
 		  "         %i : interface name\n"
@@ -1698,26 +1705,25 @@ usage(int status)
 		  "         %M : minute in 2-digits\n"
 		  "         %S : second in 2-digits\n"
 		  "         %q : sequence number for each output files\n"
-		  "       default is '/tmp/pcap_%y%m%d_%H%M%S_%i_%q.arrow'\n"
+		  "       default is '/tmp/pcap_%i_%y%m%d_%H%M%S.arrow'\n"
+		  "  -f|--force : overwrite file, even if exists\n"
+		  "     --only-headers: disables capture of payload\n"
 		  "     --parallel-write=N_FILES\n"
-		  "       enables to open multiple output files simultaneously.\n"
-		  "       (default: 1)\n"
+		  "       opens multiple output files simultaneously (default: 1)\n"
+		  "     --chunk-size=<SIZE> : size of record batch (default: 128MB)\n"
+		  "     --direct-io : enables O_DIRECT for write-i/o\n"
+		  "  -l|--limit=<LIMIT> : (default: no limit)\n"
 		  "  -p|--protocol=<PROTO>\n"
 		  "       <PROTO> is a comma separated string contains\n"
 		  "       the following tokens:\n"
 		  "         tcp4, udp4, icmp4, ipv4, tcp6, udp6, icmp6, ipv66\n"
-		  "       (default: 'tcp4,udp4,icmp4,ipv4')\n"
+		  "       (default: 'tcp4,udp4,icmp4')\n"
 		  "  -r|--rule=<RULE> : packet filtering rules\n"
 		  "       (default: none; valid only capturing mode)\n"
 		  "  -s|--stat[=INTERVAL]\n"
 		  "       enables to print statistics per INTERVAL\n"
-		  "  -t|--threads=<NUM of threads> (default: 2 * NCPUs)\n"
-		  "     --pcap-threads=<NUM of threads> (default: NCPUS)\n"
-		  "  -l|--limit=<LIMIT> : (default: no limit)\n"
-		  "     --only-headers: disables capture of payload\n"
-		  "     --chunk-size=<SIZE> : size of record batch (default: 128MB)\n"
-		  "     --direct-io : enables O_DIRECT for write-i/o\n"
-		  "     --num-queues=<N_QUEUE> : number of packet capturing queue.\n"
+		  "  -t|--threads=<NUM of threads>\n"
+		  "     --pcap-threads=<NUM of threads>\n"
 		  "  -h|--help    : shows this message\n"
 		  "\n"
 		  "  Copyright (C) 2020-2021 HeteroDB,Inc <contact@heterodb.com>\n"
@@ -1732,6 +1738,7 @@ parse_options(int argc, char *argv[])
 	static struct option long_options[] = {
 		{"input",          required_argument, NULL, 'i'},
 		{"output",         required_argument, NULL, 'o'},
+		{"force",          no_argument,       NULL, 'f'},
 		{"protocol",       required_argument, NULL, 'p'},
 		{"threads",        required_argument, NULL, 't'},
 		{"limit",          required_argument, NULL, 'l'},
@@ -1749,22 +1756,25 @@ parse_options(int argc, char *argv[])
 	int			code;
 	char	   *pos;
 
-	while ((code = getopt_long(argc, argv, "i:o:p:t:l:s::r:h",
+	while ((code = getopt_long(argc, argv, "i:o:fp:t:l:s::r:h",
 							   long_options, NULL)) >= 0)
 	{
 		char	   *token, *end;
 
 		switch (code)
 		{
-			case 'i':	/* input */
+			case 'i':	/* --input */
 				if (input_devname)
 					Elog("-i|--input was specified twice");
 				input_devname = optarg;
 				break;
-			case 'o':	/* output */
+			case 'o':	/* --output */
 				output_filename = optarg;
 				break;
-			case 'p':	/* protocol */
+			case 'f':	/* --force */
+				force_overwrite = true;
+				break;
+			case 'p':	/* --protocol */
 				protocol_mask = 0;
 				for (token = strtok_r(optarg, ",", &pos);
 					 token != NULL;
@@ -1796,7 +1806,7 @@ parse_options(int argc, char *argv[])
 						Elog("unknown protocol [%s]", token);
 				}
 				break;
-			case 't':	/* threads */
+			case 't':	/* --threads */
 				num_threads = strtol(optarg, &pos, 10);
 				if (*pos != '\0')
 					Elog("invalid -t|--threads argument: %s", optarg);
@@ -1819,11 +1829,11 @@ parse_options(int argc, char *argv[])
 					Elog("output filesize limit too small (should be > 64MB))");
 				break;
 
-			case 'r':	/* rule */
+			case 'r':	/* --rule */
 				bpf_filter_rule = pstrdup(optarg);
 				break;
 
-			case 's':	/* stat */
+			case 's':	/* --stat */
 				print_stat_interval = strtol(optarg, &pos, 10);
 				if (*pos != '\0')
 					Elog("invalid -s|--stat argument [%s]", optarg);
@@ -1831,7 +1841,7 @@ parse_options(int argc, char *argv[])
 					Elog("invalid interval to print statistics [%s]", optarg);
 				break;
 
-			case 1000:	/* pcap-threads */
+			case 1000:	/* --pcap-threads */
 				num_pcap_threads = strtol(optarg, &pos, 10);
 				if (*pos != '\0')
 					Elog("invalid --pcap-threads argument: %s", optarg);
@@ -1843,7 +1853,7 @@ parse_options(int argc, char *argv[])
 				enable_direct_io = true;
 				break;
 
-			case 1002:	/* chunk-size */
+			case 1002:	/* --chunk-size */
 				record_batch_threshold = strtol(optarg, &pos, 10);
 				if (strcasecmp(pos, "k") == 0 || strcasecmp(pos, "kb") == 0)
 					record_batch_threshold <<= 10;
@@ -1873,7 +1883,6 @@ parse_options(int argc, char *argv[])
 				break;
 				
 			default:
-				printf("code = '%c'\n", code);
 				usage(code == 'h' ? 0 : 1);
 				break;
 		}
@@ -1881,7 +1890,6 @@ parse_options(int argc, char *argv[])
 
 	if (input_devname)
 	{
-		printf("argc=%d optind=%d\n", argc, optind);
 		if (argc != optind)
 			Elog("cannot use input device and PCAP files together");
 	}
@@ -1949,12 +1957,12 @@ parse_options(int argc, char *argv[])
 	 */
 	if (input_devname)
 	{
+		if (pfring_desc_nums < 0)
+			pfring_desc_nums = 4;
 		if (num_threads < 0)
 			num_threads = 2 * NCPUS;
 		if (num_pcap_threads < 0)
-			num_pcap_threads = NCPUS;
-		if (pfring_desc_nums < 0)
-			pfring_desc_nums = (num_threads > 24 ? num_threads / 6 : 4);
+			num_pcap_threads = 6 * pfring_desc_nums;
 	}
 	else
 	{
@@ -2101,7 +2109,7 @@ init_pfring_input(void)
 {
 	uint32_t	cluster_id = (uint32_t)getpid();
 	int			i, rv;
-
+	
 	pfring_desc_array = palloc0(sizeof(pfring *) * pfring_desc_nums);
 	for (i=0; i < pfring_desc_nums; i++)
 	{
@@ -2115,6 +2123,7 @@ init_pfring_input(void)
 			Elog("failed on pfring_open: %m - "
 				 "pf_ring not loaded or interface %s is down?",
 				 input_devname);
+
 		rv = pfring_set_application_name(pd, "pcap2arrow");
 		if (rv)
 			Elog("failed on pfring_set_application_name");
