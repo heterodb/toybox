@@ -27,6 +27,11 @@
 #define Assert(x)
 #endif
 
+typedef unsigned __int128			uint128_t;
+
+
+
+
 #define __PCAP_PROTO__IPv4			0x0001
 #define __PCAP_PROTO__IPv6			0x0002
 #define __PCAP_PROTO__TCP			0x0010
@@ -133,9 +138,14 @@ static long				NCPUS;
 static __thread long	worker_id = -1;
 static volatile bool	do_shutdown = false;
 #ifndef PAGE_ALIGN
-#define PAGE_ALIGN(x)	(((x) + PAGESIZE - 1) & ~(PAGESIZE - 1))
+#define PAGE_ALIGN(x)	(((uint64_t)(x) + PAGESIZE - 1) & ~(PAGESIZE - 1))
 #endif /* PAGE_ALIGN */
-
+#ifndef LONGALIGN
+#define LONGALIGN(x)	(((uint64_t)(x) + 7UL) & ~7UL)
+#endif
+#ifndef INTALIGN
+#define INTALIGN(x)		(((uint64_t)(x) + 3UL) & ~3UL)
+#endif
 
 #if __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
 #define __ntoh16(x)		__builtin_bswap16(x)
@@ -425,6 +435,75 @@ put_variable_value(SQLfield *column, const char *addr, int sz)
 	return __buffer_usage_varlena_type(column);
 }
 
+typedef struct
+{
+	uint8_t		option_type;
+	int			option_sz;
+	const void *option_addr;
+} ipv6_option_item;
+
+static size_t
+put_composite_ipv6_options(SQLfield *column, const char *addr, int sz)
+{
+	const ipv6_option_item *ipv6_option = (const ipv6_option_item *) addr;
+	SQLfield   *subfields = column->subfields;
+	size_t		row_index = column->nitems++;
+
+	if (!addr)
+	{
+		column->nullcount++;
+		sql_buffer_clrbit(&column->nullmap, row_index);
+		sql_field_put_value(&subfields[0], NULL, 0);
+		sql_field_put_value(&subfields[1], NULL, 0);
+	}
+	else
+	{
+		Assert(sz == sizeof(ipv6_option_item));
+		sql_buffer_setbit(&column->nullmap, row_index);
+		sql_field_put_value(&subfields[0],
+							(const char *)&ipv6_option->option_type,
+							sizeof(uint8_t));
+		sql_field_put_value(&subfields[1],
+							(const char *)ipv6_option->option_addr,
+							ipv6_option->option_sz);
+	}
+	return (__buffer_usage_inline_type(column) +
+			subfields[0].__curr_usage__ +
+			subfields[1].__curr_usage__);
+}
+
+static size_t
+put_array_ipv6_options(SQLfield *column, const char *addr, int sz)
+{
+	SQLfield   *element = column->element;
+	size_t		row_index = column->nitems++;
+
+	if (row_index == 0)
+		sql_buffer_append_zero(&column->values, sizeof(int32_t));
+	if (!addr || sz == 0)
+	{
+		column->nullcount++;
+		sql_buffer_clrbit(&column->nullmap, row_index);
+		sql_buffer_append(&column->values, &element->nitems, sizeof(int32_t));
+	}
+	else
+	{
+		const ipv6_option_item *ipv6_options = (const ipv6_option_item *) addr;
+		int		i, nitems = sz / sizeof(ipv6_option_item);
+
+		Assert(sz == sizeof(ipv6_option_item) * nitems);
+		for (i=0; i < nitems; i++)
+		{
+			sql_field_put_value(element,
+								(const char *)&ipv6_options[i],
+								sizeof(ipv6_option_item));
+		}
+		sql_buffer_setbit(&column->nullmap, row_index);
+		sql_buffer_append(&column->values, &element->nitems, sizeof(int32_t));
+	}
+	return __buffer_usage_inline_type(column) + element->__curr_usage__;
+}
+
 static void
 arrowFieldAddCustomMetadata(SQLfield *column,
 							const char *key,
@@ -612,6 +691,47 @@ arrowFieldInitAsBinary(SQLtable *table, int cindex, const char *field_name)
 	table->numBuffers += 3;
 }
 
+/*
+ * IP6Options is List::<Uint8,Binary>; array of composite type
+ */
+static void
+arrowFieldInitAsIP6Options(SQLtable *table, int cindex, const char *field_name)
+{
+	SQLfield   *column = &table->columns[cindex];
+	SQLfield   *element = palloc0(sizeof(SQLfield));
+	SQLfield   *subfields = palloc0(2 * sizeof(SQLfield));
+	char		namebuf[100];
+
+	/* subfields of the composite type */
+	initArrowNode(&subfields[0].arrow_type, Int);
+	subfields[0].arrow_type.Int.bitWidth = 8;
+	subfields[0].arrow_type.Int.is_signed = false;
+	subfields[0].put_value = put_uint8_value;
+	subfields[0].field_name = "opt_code";
+
+	initArrowNode(&subfields[1].arrow_type, Binary);
+	subfields[1].put_value = put_variable_value;
+	subfields[1].field_name = "opt_data";
+
+	/* the composite type */
+	snprintf(namebuf, sizeof(namebuf), "__%s", field_name);
+	initArrowNode(&element->arrow_type, Struct);
+	element->put_value = put_composite_ipv6_options;
+	element->field_name = pstrdup(namebuf);
+	element->nfields = 2;
+	element->subfields = subfields;
+
+	/* list of the composite type */
+	memset(column, 0, sizeof(SQLfield));
+	initArrowNode(&column->arrow_type, List);
+	column->put_value = put_array_ipv6_options;
+	column->field_name = pstrdup(field_name);
+	column->element = element;
+
+	table->numFieldNodes += 4;
+    table->numBuffers += (2 + 3 + 1 + 2);
+}
+
 /* basic ethernet frame */
 static int arrow_cindex__timestamp			= -1;
 static int arrow_cindex__dst_mac			= -1;
@@ -623,12 +743,19 @@ static int arrow_cindex__ip_length			= -1;
 static int arrow_cindex__identifier			= -1;
 static int arrow_cindex__fragment			= -1;
 static int arrow_cindex__ttl				= -1;
-static int arrow_cindex__protocol			= -1;
 static int arrow_cindex__ip_checksum		= -1;
 static int arrow_cindex__src_addr			= -1;
 static int arrow_cindex__dst_addr			= -1;
 static int arrow_cindex__ip_options			= -1;
-/* TCP/UDP headers */
+/* IPv6 headers */
+static int arrow_cindex__traffic_class		= -1;
+static int arrow_cindex__flow_label			= -1;
+static int arrow_cindex__hop_limit			= -1;
+static int arrow_cindex__src_addr6			= -1;
+static int arrow_cindex__dst_addr6			= -1;
+static int arrow_cindex__ip6_options		= -1;
+/* transport layer common */
+static int arrow_cindex__protocol			= -1;
 static int arrow_cindex__src_port			= -1;
 static int arrow_cindex__dst_port			= -1;
 /* TCP headers */
@@ -675,7 +802,6 @@ arrowPcapSchemaInit(SQLtable *table)
 		__ARROW_FIELD_INIT(identifier,	Uint16Bswap);
 		__ARROW_FIELD_INIT(fragment,	Uint16Bswap);
 		__ARROW_FIELD_INIT(ttl,			Uint8);
-		__ARROW_FIELD_INIT(protocol,	Uint8);
 		__ARROW_FIELD_INIT(ip_checksum,	Uint16Bswap);
 		__ARROW_FIELD_INIT(src_addr,	IP4Addr);
 		__ARROW_FIELD_INIT(dst_addr,	IP4Addr);
@@ -684,15 +810,26 @@ arrowPcapSchemaInit(SQLtable *table)
 	/* IPv6 */
 	if ((protocol_mask & __PCAP_PROTO__IPv6) != 0)
 	{
-		Elog("IPv6 is not implemented yet");
-		__ARROW_FIELD_INIT(src_addr,	IP6Addr);
-		__ARROW_FIELD_INIT(dst_addr,	IP6Addr);
+		__ARROW_FIELD_INIT(traffic_class, Uint8);
+		__ARROW_FIELD_INIT(flow_label,  Uint32Bswap);
+		__ARROW_FIELD_INIT(hop_limit,   Uint8);
+		__ARROW_FIELD_INIT(src_addr6,	IP6Addr);
+		__ARROW_FIELD_INIT(dst_addr6,	IP6Addr);
+		__ARROW_FIELD_INIT(ip6_options, IP6Options);
 	}
-	/* TCP or UDP */
-	if ((protocol_mask & (__PCAP_PROTO__TCP | __PCAP_PROTO__UDP)) != 0)
+	/* IPv4 or IPv6 */
+	if ((protocol_mask & (__PCAP_PROTO__IPv4 |
+						  __PCAP_PROTO__IPv6)) != 0)
 	{
-		__ARROW_FIELD_INIT(src_port,	Uint16Bswap);
-		__ARROW_FIELD_INIT(dst_port,	Uint16Bswap);
+		__ARROW_FIELD_INIT(protocol,    Uint8);
+	}
+	
+	/* TCP or UDP */
+	if ((protocol_mask & (__PCAP_PROTO__TCP |
+						  __PCAP_PROTO__UDP)) != 0)
+	{
+		__ARROW_FIELD_INIT(src_port,	Uint16);	/* byte swap by caller */
+		__ARROW_FIELD_INIT(dst_port,	Uint16);	/* byte swap by caller */
 	}
 	/* TCP */
 	if ((protocol_mask & __PCAP_PROTO__TCP) != 0)
@@ -729,13 +866,13 @@ arrowPcapSchemaInit(SQLtable *table)
 	return j;
 }
 
-#define __FIELD_PUT_VALUE_DECL											\
-	SQLfield   *__field;												\
+#define __FIELD_PUT_VALUE_DECL									\
+	SQLfield   *__field;										\
 	size_t      usage = 0
-#define __FIELD_PUT_VALUE(NAME,ADDR,SZ)									\
-	Assert(arrow_cindex__##NAME >= 0);									\
-	__field = &chunk->columns[arrow_cindex__##NAME];				\
-	usage += __field->put_value(__field, (const char *)(ADDR),(SZ))
+#define __FIELD_PUT_VALUE(NAME,ADDR,SZ)							\
+	Assert(arrow_cindex__##NAME >= 0);							\
+	__field = &chunk->columns[arrow_cindex__##NAME];			\
+	usage += sql_field_put_value(__field, (const char *)(ADDR),(SZ))
 
 /*
  * handlePacketRawEthernet
@@ -775,7 +912,7 @@ handlePacketRawEthernet(SQLtable *chunk,
  */
 static const u_char *
 handlePacketIPv4Header(SQLtable *chunk,
-					   const u_char *buf, size_t sz, uint8_t *p_proto)
+					   const u_char *buf, size_t sz, int *p_proto)
 {
 	__FIELD_PUT_VALUE_DECL;
 	struct __ipv4_head {
@@ -802,13 +939,12 @@ handlePacketIPv4Header(SQLtable *chunk,
 	if (head_sz > sz)
 		goto fillup_by_null;
 
+	*p_proto = ipv4->protocol;
 	__FIELD_PUT_VALUE(tos,         &ipv4->tos,         sizeof(uint8_t));
 	__FIELD_PUT_VALUE(ip_length,   &ipv4->ip_length,   sizeof(uint16_t));
 	__FIELD_PUT_VALUE(identifier,  &ipv4->identifier,  sizeof(uint16_t));
 	__FIELD_PUT_VALUE(fragment,    &ipv4->fragment,    sizeof(uint16_t));
 	__FIELD_PUT_VALUE(ttl,         &ipv4->ttl,         sizeof(uint8_t));
-	*p_proto = ipv4->protocol;
-	__FIELD_PUT_VALUE(protocol,    &ipv4->protocol,    sizeof(uint8_t));
 	__FIELD_PUT_VALUE(ip_checksum, &ipv4->ip_checksum, sizeof(uint16_t));
 	__FIELD_PUT_VALUE(src_addr,    &ipv4->src_addr,    sizeof(uint32_t));
 	__FIELD_PUT_VALUE(dst_addr,    &ipv4->dst_addr,    sizeof(uint32_t));
@@ -831,7 +967,6 @@ fillup_by_null:
 	__FIELD_PUT_VALUE(identifier, NULL, 0);
 	__FIELD_PUT_VALUE(fragment, NULL, 0);
 	__FIELD_PUT_VALUE(ttl, NULL, 0);
-	__FIELD_PUT_VALUE(protocol, NULL, 0);
 	__FIELD_PUT_VALUE(ip_checksum, NULL, 0);
 	__FIELD_PUT_VALUE(src_addr, NULL, 0);
 	__FIELD_PUT_VALUE(dst_addr, NULL, 0);
@@ -846,9 +981,114 @@ fillup_by_null:
  */
 static const u_char *
 handlePacketIPv6Header(SQLtable *chunk,
-					   const u_char *buf, size_t sz, uint8_t *p_proto)
+					   const u_char *buf, size_t sz, int *p_proto)
 {
-	Elog("handlePacketIPv6Header not implemented yet");
+	__FIELD_PUT_VALUE_DECL;
+	struct __ipv6_head {
+		uint8_t		v0;
+		uint8_t		v1;
+		uint8_t		v2;
+		uint8_t		v3;
+		uint16_t	length;
+		uint8_t		next;
+		uint8_t		hop_limit;
+		uint8_t		src_addr6[16];
+		uint8_t		dst_addr6[16];
+		uint8_t		data[1];
+	}  *ipv6 = (struct __ipv6_head *) buf;
+	uint8_t			traffic_class;
+	uint32_t		flow_label;
+	ipv6_option_item ipv6_options[256];
+	int				nitems = 0;
+	const u_char   *pos, *end;
+	uint8_t			next;
+
+	if (!buf || sz < 40)
+		goto fillup_by_null;
+
+	if ((ipv6->v0 & 0xf0) != 0x60)
+		goto fillup_by_null;
+	traffic_class = ((ipv6->v0 & 0x0f) << 4) | ((ipv6->v1 & 0xf0) >> 4);
+	flow_label = (((uint32_t)(ipv6->v1 & 0x0f) << 16) |
+				  ((uint32_t)(ipv6->v2 << 8)) |
+				  ((uint32_t)(ipv6->v3)));
+	/* walk on the IPv6 header options */
+	next = ipv6->next;
+	pos = ipv6->data;
+	end = buf + sz;
+	while (pos < end)
+	{
+		ipv6_option_item *item;
+		int				sz;
+
+		switch (next)
+		{
+			case 0:		/* Hop-by-Hop */
+			case 43:	/* Routine */
+			case 44:	/* Fragment */
+			case 60:	/* Destination Options */
+			case 135:	/* Mobility */
+			case 139:	/* Host Identity Protocol */
+			case 140:	/* Shim6 Protocol */
+				{
+					const struct {
+						uint8_t		next;
+						uint8_t		length;
+						char		data[1];
+					}  *opts = (const void *)pos;
+					sz = 8 * opts->length + 8;
+					if (pos + sz > end)
+						break;
+					item = &ipv6_options[nitems++];
+					item->option_type = next;
+					item->option_sz = (sz - 2);
+					item->option_addr = opts->data;
+					pos += sz;
+					next = opts->next;
+				}
+				break;
+
+			case 51:	/* Authentication Header (AH) */
+				{
+					const struct {
+						uint8_t		next;
+						uint8_t		length;
+						uint16_t	reserved;
+						char		data[1];
+					}  *__ah = (const void *)pos;
+					sz = 4 * __ah->length + 8;
+					if (pos + sz > end)
+						break;
+					item = &ipv6_options[nitems++];
+					item->option_type = next;
+					item->option_sz = sz - 4;
+					item->option_addr = __ah->data;
+					pos += LONGALIGN(sz);
+					next = __ah->next;
+				}
+				break;
+
+			default:
+				goto out;
+		}
+	}
+out:
+	*p_proto = next;
+	__FIELD_PUT_VALUE(traffic_class, &traffic_class, sizeof(uint8_t));
+    __FIELD_PUT_VALUE(flow_label,  &flow_label, sizeof(uint32_t));
+    __FIELD_PUT_VALUE(hop_limit,   &ipv6->hop_limit, sizeof(uint8_t));
+    __FIELD_PUT_VALUE(src_addr6,   &ipv6->src_addr6, sizeof(uint128_t));
+    __FIELD_PUT_VALUE(dst_addr6,   &ipv6->dst_addr6, sizeof(uint128_t));
+    __FIELD_PUT_VALUE(ip6_options, ipv6_options, sizeof(ipv6_option_item) * nitems);
+	return pos;
+
+fillup_by_null:
+	__FIELD_PUT_VALUE(traffic_class, NULL, 0);
+	__FIELD_PUT_VALUE(flow_label,    NULL, 0);
+	__FIELD_PUT_VALUE(hop_limit,     NULL, 0);
+	__FIELD_PUT_VALUE(src_addr6,     NULL, 0);
+	__FIELD_PUT_VALUE(dst_addr6,     NULL, 0);
+	__FIELD_PUT_VALUE(ip6_options,   NULL, 0);
 	return NULL;
 }
 
@@ -857,7 +1097,8 @@ handlePacketIPv6Header(SQLtable *chunk,
  */
 static const u_char *
 handlePacketTcpHeader(SQLtable *chunk,
-					  const u_char *buf, size_t sz, int proto)
+					  const u_char *buf, size_t sz, int proto,
+					  int *p_src_port, int *p_dst_port)
 {
 	__FIELD_PUT_VALUE_DECL;
 	struct __tcp_head {
@@ -879,8 +1120,8 @@ handlePacketTcpHeader(SQLtable *chunk,
 	if (head_sz > sz)
 		goto fillup_by_null;
 
-	__FIELD_PUT_VALUE(src_port,     &tcp->src_port,     sizeof(uint16_t));
-	__FIELD_PUT_VALUE(dst_port,     &tcp->dst_port,     sizeof(uint16_t));
+	*p_src_port = __ntoh16(tcp->src_port);
+	*p_dst_port = __ntoh16(tcp->dst_port);
 	__FIELD_PUT_VALUE(seq_nr,       &tcp->seq_nr,       sizeof(uint32_t));
 	__FIELD_PUT_VALUE(ack_nr,       &tcp->ack_nr,       sizeof(uint32_t));
 	__FIELD_PUT_VALUE(tcp_flags,    &tcp->tcp_flags,    sizeof(uint16_t));
@@ -900,11 +1141,6 @@ handlePacketTcpHeader(SQLtable *chunk,
 	return buf + head_sz;
 
 fillup_by_null:
-	if (proto != 0x11)		/* if not UDP */
-	{
-		__FIELD_PUT_VALUE(src_port, NULL, 0);
-		__FIELD_PUT_VALUE(dst_port, NULL, 0);
-	}
 	__FIELD_PUT_VALUE(seq_nr, NULL, 0);
 	__FIELD_PUT_VALUE(ack_nr, NULL, 0);
 	__FIELD_PUT_VALUE(tcp_flags, NULL, 0);
@@ -921,7 +1157,8 @@ fillup_by_null:
  */
 static const u_char *
 handlePacketUdpHeader(SQLtable *chunk,
-					  const u_char *buf, size_t sz, int proto)
+					  const u_char *buf, size_t sz, int proto,
+					  int *p_src_port, int *p_dst_port)
 {
 	__FIELD_PUT_VALUE_DECL;
 	struct __udp_head {
@@ -933,23 +1170,14 @@ handlePacketUdpHeader(SQLtable *chunk,
 
 	if (!buf || sz < sizeof(struct __udp_head))
 		goto fillup_by_null;
-	__FIELD_PUT_VALUE(src_port,     &udp->src_port,     sizeof(uint16_t));
-	__FIELD_PUT_VALUE(dst_port,     &udp->dst_port,     sizeof(uint16_t));
+	*p_src_port = __ntoh16(udp->src_port);
+	*p_dst_port = __ntoh16(udp->dst_port);
 	__FIELD_PUT_VALUE(segment_sz,   &udp->segment_sz,   sizeof(uint16_t));
 	__FIELD_PUT_VALUE(udp_checksum, &udp->udp_checksum, sizeof(uint16_t));
 	chunk->usage += usage;
 	return buf + sizeof(struct __udp_head);
 
 fillup_by_null:
-	if (proto == 0x11)		/* only if UDP */
-	{
-		/*
-		 * handlePacketTcpHeader() put values on src_port/dst_port
-		 * for other protocols.
-		 */
-		__FIELD_PUT_VALUE(src_port, NULL, 0);
-		__FIELD_PUT_VALUE(dst_port, NULL, 0);
-	}
 	__FIELD_PUT_VALUE(segment_sz, NULL, 0);
 	__FIELD_PUT_VALUE(udp_checksum, NULL, 0);
 	chunk->usage += usage;
@@ -985,6 +1213,49 @@ fillup_by_null:
 	__FIELD_PUT_VALUE(icmp_checksum, NULL, 0);
 	chunk->usage += usage;
 	return NULL;
+}
+
+/*
+ * handlePacketTransportCommon
+ */
+static void
+handlePacketTransportCommon(SQLtable *chunk, int proto, int src_port, int dst_port)
+{
+	__FIELD_PUT_VALUE_DECL;
+
+	if ((protocol_mask & (__PCAP_PROTO__IPv4 | __PCAP_PROTO__IPv6)) != 0)
+	{
+		if (proto < 0)
+		{
+			__FIELD_PUT_VALUE(protocol, NULL, 0);
+		}
+		else
+		{
+			__FIELD_PUT_VALUE(protocol, &proto, sizeof(uint8_t));
+		}
+	}
+
+	if ((protocol_mask & (__PCAP_PROTO__TCP | __PCAP_PROTO__UDP)) != 0)
+	{
+		if (src_port < 0)
+		{
+			__FIELD_PUT_VALUE(src_port, NULL, 0);
+		}
+		else
+		{
+			__FIELD_PUT_VALUE(src_port, &src_port, sizeof(uint16_t));
+		}
+
+		if (dst_port < 0)
+		{
+			__FIELD_PUT_VALUE(dst_port, NULL, 0);
+		}
+		else
+		{
+			__FIELD_PUT_VALUE(dst_port, &dst_port, sizeof(uint16_t));
+		}
+	}
+	chunk->usage += usage;
 }
 
 /*
@@ -1416,7 +1687,9 @@ __execCaptureOnePacket(SQLtable *chunk,
 	const u_char   *end = pos + hdr->caplen;
 	const u_char   *next;
 	uint16_t		ether_type;
-	uint8_t			proto;
+	int				proto = -1;
+	int				src_port = -1;
+	int				dst_port = -1;
 
 	pos = handlePacketRawEthernet(chunk, hdr, pos, &ether_type);
 	if (!pos)
@@ -1428,13 +1701,11 @@ __execCaptureOnePacket(SQLtable *chunk,
 	{
 		if (print_stat_interval > 0)
 			atomicAdd64(&stat_ip4_packet_count, 1);
-
 		if ((protocol_mask & __PCAP_PROTO__IPv4) == 0)
 			goto fillup_by_null;
 		next = handlePacketIPv4Header(chunk, pos, end - pos, &proto);
 		if (next)
 			pos = next;
-		pos = next;
 		if ((protocol_mask & __PCAP_PROTO__IPv6) != 0)
 			handlePacketIPv6Header(chunk, NULL, 0, NULL);
 	}
@@ -1442,7 +1713,6 @@ __execCaptureOnePacket(SQLtable *chunk,
 	{
 		if (print_stat_interval > 0)
 			atomicAdd64(&stat_ip6_packet_count, 1);
-
 		if ((protocol_mask & __PCAP_PROTO__IPv6) == 0)
 			goto fillup_by_null;
 		next = handlePacketIPv6Header(chunk, pos, end - pos, &proto);
@@ -1462,29 +1732,29 @@ __execCaptureOnePacket(SQLtable *chunk,
 	{
 		if (print_stat_interval > 0)
 			atomicAdd64(&stat_tcp_packet_count, 1);
-
-		next = handlePacketTcpHeader(chunk, pos, end - pos, proto);
+		next = handlePacketTcpHeader(chunk, pos, end - pos, proto,
+									 &src_port, &dst_port);
 		if (next)
 			pos = next;
 	}
 	else
 	{
-		handlePacketTcpHeader(chunk, NULL, 0, proto);
+		handlePacketTcpHeader(chunk, NULL, 0, proto, NULL, NULL);
 	}
-
+	
 	/* UDP */
 	if (proto == 0x11 && (protocol_mask & __PCAP_PROTO__UDP) != 0)
 	{
 		if (print_stat_interval > 0)
 			atomicAdd64(&stat_udp_packet_count, 1);
-
-		next = handlePacketUdpHeader(chunk, pos, end - pos, proto);
+		next = handlePacketUdpHeader(chunk, pos, end - pos, proto,
+									 &src_port, &dst_port);
 		if (next)
 			pos = next;
 	}
 	else
 	{
-		handlePacketUdpHeader(chunk, NULL, 0, proto);
+		handlePacketUdpHeader(chunk, NULL, 0, proto, NULL, NULL);
 	}
 
 	/* ICMP */
@@ -1492,7 +1762,6 @@ __execCaptureOnePacket(SQLtable *chunk,
 	{
 		if (print_stat_interval > 0)
 			atomicAdd64(&stat_icmp_packet_count, 1);
-
 		next = handlePacketIcmpHeader(chunk, pos, end - pos, proto);
 		if (next)
 			pos = next;
@@ -1501,6 +1770,8 @@ __execCaptureOnePacket(SQLtable *chunk,
 	{
 		handlePacketIcmpHeader(chunk, NULL, 0, proto);
 	}
+	/* Transport common */
+	handlePacketTransportCommon(chunk, proto, src_port, dst_port);
 
 	/* Payload */
 	if (!only_headers)
@@ -1514,11 +1785,12 @@ fillup_by_null:
 	if ((protocol_mask & __PCAP_PROTO__IPv6) != 0)
 		handlePacketIPv6Header(chunk, NULL, 0, NULL);
 	if ((protocol_mask & __PCAP_PROTO__TCP) != 0)
-		handlePacketTcpHeader(chunk, NULL, 0, 0xff);
+		handlePacketTcpHeader(chunk, NULL, 0, -1, NULL, NULL);
 	if ((protocol_mask & __PCAP_PROTO__UDP) != 0)
-		handlePacketUdpHeader(chunk, NULL, 0, 0xff);
+		handlePacketUdpHeader(chunk, NULL, 0, -1, NULL, NULL);
 	if ((protocol_mask & __PCAP_PROTO__ICMP) != 0)
-		handlePacketIcmpHeader(chunk, NULL, 0, 0xff);
+		handlePacketIcmpHeader(chunk, NULL, 0, -1);
+	handlePacketTransportCommon(chunk, -1, -1, -1);
 	if (!only_headers && pos != NULL)
 		handlePacketPayload(chunk, pos, end - pos);
 	chunk->nitems++;
