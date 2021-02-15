@@ -108,7 +108,6 @@ static int				pfring_desc_nums = -1;
 
 typedef struct
 {
-	int					pcap_worker_id;
 	pcap_t			   *pcap_handle;
 	FILE			   *pcap_filp;
 	const char		   *pcap_filename;
@@ -223,6 +222,16 @@ on_sigint_handler(int signal)
 	{
 		for (i=0; i < pfring_desc_nums; i++)
 			pfring_breakloop(pfring_desc_array[i]);
+	}
+	if (pcap_file_desc_array)
+	{
+		for (i=0; i < pcap_file_desc_nums; i++)
+		{
+			pcap_t *pcap_handle = pcap_file_desc_array[i].pcap_handle;
+
+			if (pcap_handle)
+				pcap_breakloop(pcap_handle);
+		}
 	}
 	errno = errno_saved;
 }
@@ -1925,7 +1934,12 @@ pcap_file_worker_main(void *__arg)
 			pcap_fopen_offline_with_tstamp_precision(pfdesc->pcap_filp,
 													 PCAP_TSTAMP_PRECISION_MICRO,
 													 pfdesc->pcap_errbuf);
-		for (;;)
+		if (!pfdesc->pcap_handle)
+			Elog("failed on open pcap file ('%s'): %s",
+				 pfdesc->pcap_filename,
+				 pfdesc->pcap_errbuf);
+
+		while (!do_shutdown)
 		{
 			struct pcap_pkthdr hdr;
 			struct pfring_pkthdr __hdr;
@@ -2174,7 +2188,6 @@ parse_options(int argc, char *argv[])
 			filp = fopen(filename, "rb");
 			if (!filp)
 				Elog("failed to open '%s': %m", filename);
-			pfdesc->pcap_worker_id = i;
 			pfdesc->pcap_filp = filp;
 			pfdesc->pcap_filename = pstrdup(filename);
 		}
@@ -2185,7 +2198,6 @@ parse_options(int argc, char *argv[])
 		/* input from stdin... */
 		pcapFileDesc   *pfdesc = palloc0(sizeof(pcapFileDesc));
 
-		pfdesc->pcap_worker_id = 0;
 		pfdesc->pcap_filp = stdin;
 		pfdesc->pcap_filename = "/dev/stdin";
 
