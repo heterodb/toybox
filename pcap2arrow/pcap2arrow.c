@@ -27,11 +27,6 @@
 #define Assert(x)
 #endif
 
-typedef unsigned __int128			uint128_t;
-
-
-
-
 #define __PCAP_PROTO__IPv4			0x0001
 #define __PCAP_PROTO__IPv6			0x0002
 #define __PCAP_PROTO__TCP			0x0010
@@ -992,8 +987,8 @@ handlePacketIPv6Header(SQLtable *chunk,
 		uint16_t	length;
 		uint8_t		next;
 		uint8_t		hop_limit;
-		uint8_t		src_addr6[16];
-		uint8_t		dst_addr6[16];
+		uint8_t		src_addr6[IP6ADDR_LEN];
+		uint8_t		dst_addr6[IP6ADDR_LEN];
 		uint8_t		data[1];
 	}  *ipv6 = (struct __ipv6_head *) buf;
 	uint8_t			traffic_class;
@@ -1077,8 +1072,8 @@ out:
 	__FIELD_PUT_VALUE(traffic_class, &traffic_class, sizeof(uint8_t));
     __FIELD_PUT_VALUE(flow_label,  &flow_label, sizeof(uint32_t));
     __FIELD_PUT_VALUE(hop_limit,   &ipv6->hop_limit, sizeof(uint8_t));
-    __FIELD_PUT_VALUE(src_addr6,   &ipv6->src_addr6, sizeof(uint128_t));
-    __FIELD_PUT_VALUE(dst_addr6,   &ipv6->dst_addr6, sizeof(uint128_t));
+    __FIELD_PUT_VALUE(src_addr6,   &ipv6->src_addr6, IP6ADDR_LEN);
+    __FIELD_PUT_VALUE(dst_addr6,   &ipv6->dst_addr6, IP6ADDR_LEN);
     __FIELD_PUT_VALUE(ip6_options, ipv6_options, sizeof(ipv6_option_item) * nitems);
 	return pos;
 
