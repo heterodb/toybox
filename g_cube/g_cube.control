@@ -1,0 +1,5 @@
+# g_cube extension
+comment = 'GPU version of contrib/cube'
+default_version = '1.0'
+module_pathname = '$libdir/g_cube'
+relocatable = true
