@@ -59,7 +59,6 @@ __pg_extension_schema_oid(const char *extname)
 	sdesc = systable_beginscan(rel, ExtensionNameIndexId, true,
 							   NULL, 1, skeys);
 	tuple = systable_getnext(sdesc);
-	elog(INFO, "tuple = %p", tuple);
 	if (HeapTupleIsValid(tuple))
 		schema_oid = ((Form_pg_extension) GETSTRUCT(tuple))->extnamespace;
 	systable_endscan(sdesc);
@@ -238,6 +237,55 @@ g_cube_lookup_extra_devcast(MemoryContext memcxt,
 	return dcast;
 }
 
+static Oid
+g_cube_arrow_lookup_pgtype(ArrowField *field,
+						   Oid hint_oid,
+						   int32 *p_type_mod)
+{
+	if (field->type.node.tag == ArrowNodeTag__Binary &&
+		hint_oid == pg_cube_type_oid())
+	{
+		return pg_cube_type_oid();
+	}
+	return InvalidOid;
+}
+
+static bool
+g_cube_arrow_datum_ref(kern_data_store *kds,
+					   kern_colmeta *cmeta, size_t index,
+					   Datum *p_value,
+					   bool  *p_isnull)
+{
+	if (cmeta->atttypid == pg_cube_type_oid())
+	{
+		uint32 *offset = (uint32 *)((char *)kds + __kds_unpack(cmeta->values_offset));
+		char   *extra = (char *)kds + __kds_unpack(cmeta->extra_offset);
+		size_t	extra_sz = __kds_unpack(cmeta->extra_length);
+		uint32	len = offset[index+1] - offset[index];
+		uint32	header, nitems;
+		struct varlena *res;
+
+		if (offset[index] > offset[index+1] ||
+			offset[index+1] > extra_sz)
+			elog(ERROR, "corrupted arrow file? offset points out of extra buffer");
+
+		memcpy(&header, extra + offset[index], sizeof(uint32));
+		nitems = (header & 0x7fffffffU);
+		if ((header & 0x80000000U) == 0)
+			nitems += nitems;
+		if (len != sizeof(uint32) + sizeof(uint64) * nitems)
+			elog(ERROR, "invalid cube data format");
+		res = palloc(VARHDRSZ + len);
+		SET_VARSIZE(res, VARHDRSZ + len);
+		memcpy(VARDATA(res), extra + offset[index], len);
+
+		*p_value = PointerGetDatum(res);
+		*p_isnull = false;
+		return true;
+	}
+	return false;
+}
+
 void
 _PG_init(void)
 {
@@ -248,6 +296,8 @@ _PG_init(void)
 	g_cubeUsersExtraDesc.lookup_extra_devtype = g_cube_lookup_extra_devtype;
 	g_cubeUsersExtraDesc.lookup_extra_devfunc = g_cube_lookup_extra_devfunc;
 	g_cubeUsersExtraDesc.lookup_extra_devcast = g_cube_lookup_extra_devcast;
+	g_cubeUsersExtraDesc.arrow_lookup_pgtype  = g_cube_arrow_lookup_pgtype;
+	g_cubeUsersExtraDesc.arrow_datum_ref      = g_cube_arrow_datum_ref;
 
 	g_cube_extra_flags = pgstrom_register_users_extra(&g_cubeUsersExtraDesc);
 }

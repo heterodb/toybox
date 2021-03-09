@@ -28,22 +28,14 @@ typedef struct __NDBOX
 #define IS_POINT(header)	(((header) & POINT_BIT) != 0)
 #define DIM(header)			((header) & DIM_MASK)
 
-#define LL_COORD(cube, i) ( (cube)->x[i] )
-#define UR_COORD(cube, i) ( IS_POINT(cube) ? (cube)->x[i] : (cube)->x[(i) + DIM(cube)] )
-
-
-
 STATIC_FUNCTION(cl_bool)
-cube_contains_v0(__NDBOX *a, __NDBOX *b)
+cube_contains_v0(cl_uint header_a, double *ll_coord_a,
+				 cl_uint header_b, double *ll_coord_b)
 {
-	cl_uint		header_a = __Fetch(&a->header);
-	cl_uint		header_b = __Fetch(&b->header);
 	cl_uint		dim_a = DIM(header_a);
 	cl_uint		dim_b = DIM(header_b);
-	double	   *ll_coord_a = a->x;
-	double	   *ll_coord_b = b->x;
-	double	   *ur_coord_a = a->x + (IS_POINT(header_a) ? 0 : dim_a);
-	double	   *ur_coord_b = b->x + (IS_POINT(header_b) ? 0 : dim_b);
+	double	   *ur_coord_a = ll_coord_a + (IS_POINT(header_a) ? 0 : dim_a);
+	double	   *ur_coord_b = ll_coord_b + (IS_POINT(header_b) ? 0 : dim_b);
 	double		aval, bval;
 	int			i, n;
 
@@ -72,6 +64,56 @@ cube_contains_v0(__NDBOX *a, __NDBOX *b)
 	return true;
 }
 
+DEVICE_INLINE(cl_bool)
+pg_cube_datum_extract(kern_context *kcxt, pg_cube_t arg,
+					  cl_uint *p_header, cl_double **p_values)
+{
+	char	   *pos;
+	cl_uint		sz;
+	cl_uint		header;
+	cl_uint		nitems;
+
+	if (arg.isnull)
+		return false;
+	if (arg.length < 0)
+	{
+		if (VARATT_IS_COMPRESSED(arg.value) ||
+			VARATT_IS_EXTERNAL(arg.value))
+		{
+			STROM_CPU_FALLBACK(kcxt, ERRCODE_STROM_VARLENA_UNSUPPORTED,
+							   "varlena datum is compressed or external");
+			return false;
+		}
+		pos = VARDATA_ANY(arg.value);
+		sz = VARSIZE_ANY_EXHDR(arg.value);
+	}
+	else
+	{
+		pos = arg.value;
+		sz = arg.length;
+	}
+
+	if (sz < sizeof(cl_uint))
+	{
+		STROM_CPU_FALLBACK(kcxt, ERRCODE_INVALID_BINARY_REPRESENTATION,
+						   "cube datum is too small");
+		return false;
+	}
+	memcpy(&header, pos, sizeof(cl_uint));
+	nitems = (header & DIM_MASK);
+	if ((header & POINT_BIT) == 0)
+		nitems += nitems;
+	if (sz < sizeof(cl_uint) + sizeof(cl_double) * nitems)
+	{
+		STROM_CPU_FALLBACK(kcxt, ERRCODE_INVALID_BINARY_REPRESENTATION,
+						   "cube datum is too small");
+		return false;
+	}
+	*p_header = header;
+	*p_values = (cl_double *)(pos + sizeof(cl_uint));	/* unaligned */
+	return true;
+}
+
 DEVICE_FUNCTION(pg_bool_t)
 pgfn_cube_contains(kern_context *kcxt, pg_cube_t arg1, pg_cube_t arg2)
 {
@@ -79,8 +121,23 @@ pgfn_cube_contains(kern_context *kcxt, pg_cube_t arg1, pg_cube_t arg2)
 
 	result.isnull = arg1.isnull | arg2.isnull;
 	if (!result.isnull)
-		result.value = cube_contains_v0((__NDBOX *)VARDATA_ANY(arg1.value),
-										(__NDBOX *)VARDATA_ANY(arg2.value));
+	{
+		cl_uint		header1;
+		cl_uint		header2;
+		cl_double  *values1;
+		cl_double  *values2;
+
+		if (pg_cube_datum_extract(kcxt, arg1, &header1, &values1) &&
+			pg_cube_datum_extract(kcxt, arg2, &header2, &values2))
+		{
+			result.value = cube_contains_v0(header1, values1,
+											header2, values2);
+		}
+		else
+		{
+			result.isnull = true;
+		}
+	}
 	return result;
 }
 
@@ -91,8 +148,23 @@ pgfn_cube_contained(kern_context *kcxt, pg_cube_t arg1, pg_cube_t arg2)
 
 	result.isnull = arg1.isnull | arg2.isnull;
 	if (!result.isnull)
-		result.value = cube_contains_v0((__NDBOX *)VARDATA_ANY(arg2.value),
-										(__NDBOX *)VARDATA_ANY(arg1.value));
+	{
+		cl_uint		header1;
+		cl_uint		header2;
+		cl_double  *values1;
+		cl_double  *values2;
+
+		if (pg_cube_datum_extract(kcxt, arg2, &header2, &values2) &&
+			pg_cube_datum_extract(kcxt, arg1, &header1, &values1))
+		{
+			result.value = cube_contains_v0(header2, values2,
+											header1, values1);
+		}
+		else
+		{
+			result.isnull = true;
+		}
+	}
 	return result;
 }
 
@@ -104,23 +176,30 @@ pgfn_cube_ll_coord(kern_context *kcxt, pg_cube_t arg1, pg_int4_t arg2)
 	result.isnull = arg1.isnull | arg2.isnull;
 	if (!result.isnull)
 	{
-		//TODO: in case when read from arrow!!
-		__NDBOX	   *c = (__NDBOX *)VARDATA_ANY(arg1.value);
-		cl_uint		header_c = __Fetch(&c->header);
-		cl_uint		dim_c = DIM(header_c);
-		cl_int		index = arg2.value;
+		cl_uint		header;
+		cl_double  *values;
 
-		if (index > 0 && index <= dim_c)
+		if (pg_cube_datum_extract(kcxt, arg1, &header, &values))
 		{
-			if (IS_POINT(header_c))
-				result.value = __Fetch(&c->x[index-1]);
+			cl_uint		dim = DIM(header);
+			cl_int		index = arg2.value;
+
+			if (index > 0 && index <= dim)
+			{
+				if (IS_POINT(header))
+					result.value = __Fetch(&values[index-1]);
+				else
+					result.value = Max(__Fetch(&values[index-1]),
+									   __Fetch(&values[index-1 + dim]));
+			}
 			else
-				result.value = Max(__Fetch(&c->x[index-1]),
-								   __Fetch(&c->x[index-1 + dim_c]));
+			{
+				result.value = 0.0;
+			}
 		}
 		else
 		{
-			result.value = 0.0;
+			result.isnull = true;
 		}
 	}
 	return result;
