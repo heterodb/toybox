@@ -1,0 +1,114 @@
+issue_20210314/cuda_ipc_mem
+
+This program is a stand-alone software to reproduce our problem
+when cuIpcOpenMemHandle tries to map device memory allocated by
+another process.
+We could observe the problem at: 460.32,
+
+but not
+
+* Steps to reproduce
+
+1. The producer process allocates three device memory segments
+   using cuMemAlloc(), with bytesize=146064, 226656 and 154909264
+   in our observations, but no guarantees it is the only cases.
+
+2. The producer process gets IPC memory handle using
+   cuIpcGetMemHandle(); that should return a unique handle for
+   each memory segment.
+
+3. The consumer process create a CUDA context.
+
+4. The consumer process opens the above device memory segments
+   using cuIpcOpenMemHandle() - will be succeeded at the first trial.
+
+5. The consumer process closes the mapped device memory segments
+   using cuIpcCloseMemHandle()
+
+6. The consumer process destroys the CUDA context built at (3).
+
+7. The consumer process creates a new CUDA context again.
+
+8. The consumer process tries to open the above device memory
+   segments using cuIpcOpenMemHandle(), will be failed at the
+   second trial.
+
+
+Below is the result of reproduction program.
+
+[kaigai@magro issue_20210314]$ ./cuda_ipc_mem
+Mon Mar 15 11:00:36 2021
++-----------------------------------------------------------------------------+
+| NVIDIA-SMI 460.32.03    Driver Version: 460.32.03    CUDA Version: 11.2     |
+|-------------------------------+----------------------+----------------------+
+| GPU  Name        Persistence-M| Bus-Id        Disp.A | Volatile Uncorr. ECC |
+| Fan  Temp  Perf  Pwr:Usage/Cap|         Memory-Usage | GPU-Util  Compute M. |
+|                               |                      |               MIG M. |
+|===============================+======================+======================|
+|   0  Tesla V100-PCIE...  Off  | 00000000:65:00.0 Off |                    0 |
+| N/A   47C    P0    39W / 250W |     18MiB / 16160MiB |      0%      Default |
+|                               |                      |                  N/A |
++-------------------------------+----------------------+----------------------+
+
++-----------------------------------------------------------------------------+
+| Processes:                                                                  |
+|  GPU   GI   CI        PID   Type   Process name                  GPU Memory |
+|        ID   ID                                                   Usage      |
+|=============================================================================|
+|    0   N/A  N/A   1773498      C   ./cuda_ipc_mem                     14MiB |
++-----------------------------------------------------------------------------+
+GPUmem[0] ptr=0x7fe717a00000 sz=146064 handle[2331990,1b0fba,23a90,200 650000000000,4200000000,c1d000bb00000000,5c0000ca]
+GPUmem[1] ptr=0x7fe717a23c00 sz=226656 handle[2331990,1b0fba,37560,23c0000000200 650000000000,4200000000,c1d000bb00000000,5c0000ca]
+GPUmem[2] ptr=0x7fe6fe000000 sz=154909264 handle[2331990,1b0fba,93bba50,93bc 650000000000,4300000000,c1d000bb00000000,5c0000cc]
+child: cuCtxCreate done
+IpcOpen[0] rc=0 dptr=0x7fe717a00000 [2331990,1b0fba,23a90,200 650000000000,4200000000,c1d000bb00000000,5c0000ca]
+IpcOpen[1] rc=0 dptr=0x7fe717a23c00 [2331990,1b0fba,37560,23c0000000200 650000000000,4200000000,c1d000bb00000000,5c0000ca]
+IpcOpen[2] rc=0 dptr=0x7fe6fe000000 [2331990,1b0fba,93bba50,93bc 650000000000,4300000000,c1d000bb00000000,5c0000cc]
+child: cuCtxDestroy done
+child: cuCtxCreate done
+IpcOpen[0] rc=400 dptr=0x7fe717a00000 [2331990,1b0fba,23a90,200 650000000000,4200000000,c1d000bb00000000,5c0000ca]
+child_main:107: failed on cuIpcOpenMemHandle: CUDA_ERROR_INVALID_HANDLE
+
+
+
+An interesting observation is, skip of (6) - destroy of CUDA context, and
+(7) - create a new CUDA context, eliminates the problem.
+I doubt that cuCtxDestroy() remains something strange state on the process
+private memory, then, it leads unexpected results.
+
+Below is another results when we skip (6) and (7).
+It shows the second trial also opened the device memory allocated by the
+producer process successfully.
+
+[kaigai@magro issue_20210314]$ ./cuda_ipc_mem 0
+Mon Mar 15 11:04:57 2021
++-----------------------------------------------------------------------------+
+| NVIDIA-SMI 460.32.03    Driver Version: 460.32.03    CUDA Version: 11.2     |
+|-------------------------------+----------------------+----------------------+
+| GPU  Name        Persistence-M| Bus-Id        Disp.A | Volatile Uncorr. ECC |
+| Fan  Temp  Perf  Pwr:Usage/Cap|         Memory-Usage | GPU-Util  Compute M. |
+|                               |                      |               MIG M. |
+|===============================+======================+======================|
+|   0  Tesla V100-PCIE...  Off  | 00000000:65:00.0 Off |                    0 |
+| N/A   46C    P0    39W / 250W |     18MiB / 16160MiB |      0%      Default |
+|                               |                      |                  N/A |
++-------------------------------+----------------------+----------------------+
+
++-----------------------------------------------------------------------------+
+| Processes:                                                                  |
+|  GPU   GI   CI        PID   Type   Process name                  GPU Memory |
+|        ID   ID                                                   Usage      |
+|=============================================================================|
+|    0   N/A  N/A   1773973      C   ./cuda_ipc_mem                     14MiB |
++-----------------------------------------------------------------------------+
+GPUmem[0] ptr=0x7fd18da00000 sz=146064 handle[fbe990,1b1195,23a90,200 650000000000,4200000000,c1d000cb00000000,5c0000ca]
+GPUmem[1] ptr=0x7fd18da23c00 sz=226656 handle[fbe990,1b1195,37560,23c0000000200 650000000000,4200000000,c1d000cb00000000,5c0000ca]
+GPUmem[2] ptr=0x7fd174000000 sz=154909264 handle[fbe990,1b1195,93bba50,93bc 650000000000,4300000000,c1d000cb00000000,5c0000cc]
+child: cuCtxCreate done
+IpcOpen[0] rc=0 dptr=0x7fd18da00000 [fbe990,1b1195,23a90,200 650000000000,4200000000,c1d000cb00000000,5c0000ca]
+IpcOpen[1] rc=0 dptr=0x7fd18da23c00 [fbe990,1b1195,37560,23c0000000200 650000000000,4200000000,c1d000cb00000000,5c0000ca]
+IpcOpen[2] rc=0 dptr=0x7fd174000000 [fbe990,1b1195,93bba50,93bc 650000000000,4300000000,c1d000cb00000000,5c0000cc]
+IpcOpen[0] rc=0 dptr=0x7fd18da00000 [fbe990,1b1195,23a90,200 650000000000,4200000000,c1d000cb00000000,5c0000ca]
+IpcOpen[1] rc=0 dptr=0x7fd18da23c00 [fbe990,1b1195,37560,23c0000000200 650000000000,4200000000,c1d000cb00000000,5c0000ca]
+IpcOpen[2] rc=0 dptr=0x7fd174000000 [fbe990,1b1195,93bba50,93bc 650000000000,4300000000,c1d000cb00000000,5c0000cc]
+[kaigai@magro issue_20210314]$
