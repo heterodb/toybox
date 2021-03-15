@@ -34,9 +34,9 @@ cube_contains_v0(cl_uint header_a, double *ll_coord_a,
 {
 	cl_uint		dim_a = DIM(header_a);
 	cl_uint		dim_b = DIM(header_b);
-	double	   *ur_coord_a = ll_coord_a + (IS_POINT(header_a) ? 0 : dim_a);
-	double	   *ur_coord_b = ll_coord_b + (IS_POINT(header_b) ? 0 : dim_b);
-	double		aval, bval;
+	double	   *ur_coord_a = (IS_POINT(header_a) ? NULL : ll_coord_a + dim_a);
+	double	   *ur_coord_b = (IS_POINT(header_b) ? NULL : ll_coord_b + dim_b);
+	double		aval, bval, temp;
 	int			i, n;
 
 	if (dim_a < dim_b)
@@ -52,12 +52,37 @@ cube_contains_v0(cl_uint header_a, double *ll_coord_a,
 	n = Min(dim_a, dim_b);
 	for (i=0; i < n; i++)
 	{
-		aval = Min(__Fetch(&ll_coord_a[i]), __Fetch(&ur_coord_a[i]));
-		bval = Min(__Fetch(&ll_coord_b[i]), __Fetch(&ur_coord_b[i]));
+		aval = __Fetch(&ll_coord_a[i]);
+		if (ur_coord_a)
+		{
+			temp = __Fetch(&ur_coord_a[i]);
+			if (aval > temp)
+				aval = temp;
+		}
+		bval = __Fetch(&ll_coord_b[i]);
+		if (ur_coord_b)
+		{
+			temp = __Fetch(&ur_coord_b[i]);
+			if (bval > temp)
+				bval = temp;
+		}
 		if (aval > bval)
 			return false;
-		aval = Min(__Fetch(&ll_coord_a[i]), __Fetch(&ur_coord_a[i]));
-		bval = Min(__Fetch(&ll_coord_b[i]), __Fetch(&ur_coord_b[i]));
+
+		aval = __Fetch(&ll_coord_a[i]);
+		if (ur_coord_a)
+		{
+			temp = __Fetch(&ur_coord_a[i]);
+			if (aval < temp)
+				aval = temp;
+		}
+		bval = __Fetch(&ll_coord_b[i]);
+		if (ur_coord_b)
+		{
+			temp = __Fetch(&ur_coord_b[i]);
+			if (bval < temp)
+				bval = temp;
+		}
 		if (aval < bval)
 			return false;
 	}
@@ -186,11 +211,14 @@ pgfn_cube_ll_coord(kern_context *kcxt, pg_cube_t arg1, pg_int4_t arg2)
 
 			if (index > 0 && index <= dim)
 			{
-				if (IS_POINT(header))
-					result.value = __Fetch(&values[index-1]);
-				else
-					result.value = Max(__Fetch(&values[index-1]),
-									   __Fetch(&values[index-1 + dim]));
+				result.value = __Fetch(&values[index-1]);
+				if (!IS_POINT(header))
+				{
+					cl_double	fval = __Fetch(&values[index-1 + dim]);
+
+					if (result.value < fval)
+						result.value = fval;
+				}
 			}
 			else
 			{
