@@ -3,9 +3,8 @@ issue_20210314/cuda_ipc_mem
 This program is a stand-alone software to reproduce our problem
 when cuIpcOpenMemHandle tries to map device memory allocated by
 another process.
-We could observe the problem at: 460.32,
-
-but not
+We could observe the problem at: 460.32.03, 455.32.00,
+but not reproducible at: 450.102.04
 
 * Steps to reproduce
 
