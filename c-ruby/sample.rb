@@ -1,4 +1,4 @@
-#!/usr/bin/ruby -I . --debug
+#!/usr/bin/ruby -I .
 
 require 'ArrowFile'
 
@@ -15,7 +15,20 @@ class MyTest
   def action
     @af.action
   end
+  def showall(hash)
+    @af.showall(hash)
+  end
+  def show(hash)
+    @af.show(hash)
+  end
 end
 
-v = MyTest.new("hogehoge")
+hash = { "aaa" => "panda",
+         "bbb" => "lion",
+         "ccc" => "capybara",
+         "ddd" => "pug" }
+
+v = MyTest.new("hogehoge unkounko")
 v.action
+v.showall(hash)
+v.show(hash)
