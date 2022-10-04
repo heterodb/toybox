@@ -24,6 +24,7 @@ int main(int argc, char *argv[])
 	void	   *image;
 	size_t		length;
 	void	   *kern_args[10];
+	char		buffer[1024];
 
 	if (argc < 3)
 		Elog("usage: %s <cuda_module> [symbols]");
@@ -50,35 +51,15 @@ int main(int argc, char *argv[])
 	rc = cuModuleLoadData(&cuda_module, image);
 	if (rc != CUDA_SUCCESS)
 		Elog("failed on cuModuleLoadData: %d", rc);
-#if 0
-	rc = cuModuleGetGlobal(&dptr, &sz, cuda_module, "foo1");
+
+	rc = cuModuleGetGlobal(&dptr, &sz, cuda_module, "func_map_catalog");
 	if (rc != CUDA_SUCCESS)
-		Elog("failed on cuModuleGetGlobal('foo1'): %d", rc);
+		Elog("failed on cuModuleGetGlobal('func_map_catalog'): %d", rc);
 	printf("foo1 --> %p, sz=%zu\n", (void *)dptr, sz);
-	rc = cuModuleGetGlobal(&dptr, &sz, cuda_module, "foo2");
-	if (rc != CUDA_SUCCESS)
-		Elog("failed on cuModuleGetGlobal('foo2'): %d", rc);
-	printf("foo2 --> %p, sz=%zu\n", (void *)dptr, sz);
-#endif
-	rc = cuModuleGetFunction(&f_setup, cuda_module, "kern_setup");
-	if (rc != CUDA_SUCCESS)
-		Elog("failed on cuModuleGetFunction('kern_setup'): %d", rc);
+
 	rc = cuModuleGetFunction(&f_sample, cuda_module, "kern_sample");
 	if (rc != CUDA_SUCCESS)
 		Elog("failed on cuModuleGetFunction('kern_sample'): %d", rc);
-	rc = cuMemAllocManaged(&dptr, 1024, CU_MEM_ATTACH_GLOBAL);
-	if (rc != CUDA_SUCCESS)
-		Elog("failed on cuMemAllocManaged: %d", rc);
-	kern_args[0] = &dptr;
-	rc = cuLaunchKernel(f_setup,
-						1, 1, 1,
-						1, 1, 1,
-						0,
-						CU_STREAM_PER_THREAD,
-						kern_args,
-						NULL);
-	if (rc != CUDA_SUCCESS)
-		Elog("failed on cuLaunchKernel: %d", rc);
 	rc = cuLaunchKernel(f_sample,
 						1, 1, 1,
 						64, 1, 1,

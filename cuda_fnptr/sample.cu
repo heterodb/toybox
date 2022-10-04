@@ -1,41 +1,66 @@
 #include <stdio.h>
 #include <stdint.h>
+#include <stdarg.h>
 #include <cuda.h>
 #include <cuda_runtime.h>
 
 #define get_global_id()         (threadIdx.x + blockIdx.x * blockDim.x)
 
-extern "C" __device__ void
-foo1(void)
+extern "C" __device__ int
+foo1(int *rv, ...)
 {
-	printf("foo1 thread: %u\n", get_global_id());
+	va_list		ap;
+	const char *arg1;
+	double		arg2;
+
+	va_start(ap, rv);
+	arg1 = va_arg(ap, const char *);
+	arg2 = va_arg(ap, double);
+	va_end(ap);
+
+	printf("foo1 thread=%u arg1=[%s] arg2=[%f]\n", get_global_id(), arg1, arg2);
+	*rv = 1234;
+
+	return 0;
 }
 
-extern "C" __device__ void
-foo2(void)
+extern "C" __device__ int
+foo2(int *rv, ...)
 {
-	printf("foo2 thread: %u\n", get_global_id());
+	va_list		ap;
+	int			arg1;
+
+	va_start(ap, rv);
+    arg1 = va_arg(ap, int);
+	va_end(ap);
+
+	printf("foo2 thread=%u arg1=[%d]\n", get_global_id(), arg1);
+	*rv = 2345;
+
+	return 0;
 }
 
-typedef struct {
-	void	(*fn1)(void);
-	void	(*fn2)(void);
-} func_map;
-
+__device__ struct {
+	uint32_t	opcode;
+	int		  (*func)(int *rv,...);
+} func_map_catalog[] = {
+	{ 1234, foo1 },
+	{ 2345, foo2 },
+	{NULL, NULL},
+};
 
 extern "C" __global__ void
-kern_setup(func_map *f_map)
+kern_sample(char *f_map)
 {
-	printf("foo1 = %p foo2 = %p\n", foo1, foo2);
-	f_map->fn1 = foo1;
-	f_map->fn2 = foo2;
-}
+	const char *str = "hello world";
+	double		fval = 345.678;
+	int			ival = 12345;
+	int			rv;
 
-extern "C" __global__ void
-kern_sample(func_map *f_map)
-{
 	if (get_global_id() % 2 == 0)
-		f_map->fn1();
+		func_map_catalog[0].func(&rv, str, fval);
 	else
-		f_map->fn2();
+		func_map_catalog[1].func(&rv, ival);
+
+	printf("thread=%u rv=%d\n", get_global_id(), rv);
 }
