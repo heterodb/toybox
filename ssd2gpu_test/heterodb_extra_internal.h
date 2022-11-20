@@ -92,16 +92,12 @@ extern char	*heterodb_extra_module_init(unsigned int pg_version_num);
 extern unsigned int		heterodb_extra_pg_version_num;
 extern __thread heterodb_extra_error_info heterodb_extra_error_data;
 
-#define Elog(fmt,...)										\
-	do {													\
-		int		__errno_saved = errno;						\
-		heterodb_extra_error_data.filename = __FILE__;		\
-		heterodb_extra_error_data.lineno = __LINE__;		\
-		heterodb_extra_error_data.funcname = __FUNCTION__;	\
-		snprintf(heterodb_extra_error_data.message,			\
-				 sizeof(heterodb_extra_error_data),			\
-				 fmt, ##__VA_ARGS__);						\
-		errno = __errno_saved;								\
+#define __Elog(fmt,...)								\
+	do {											\
+		fprintf(stderr, "[%s:%d@%s]" fmt "\n",		\
+				__FILE__, __LINE__, __FUNCTION__,	\
+				##__VA_ARGS__);						\
+		exit(1);									\
 	} while(0)
 
 #endif	/* __HETERODB_EXTRA_INTERNAL_H__ */

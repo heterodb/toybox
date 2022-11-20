@@ -30,15 +30,13 @@
 #include <cuda.h>
 #include <cufile.h>
 #include <nvml.h>
-#include "heterodb_extra.h"
+#include "heterodb_extra_internal.h"
 #include "nvme_strom.h"
 
 /* misc macros */
 #ifndef offsetof
 #define offsetof(type, field)	((long) &((type *)0)->field)
 #endif
-#define Max(a,b)				((a) > (b) ? (a) : (b))
-#define Min(a,b)				((a) < (b) ? (a) : (b))
 
 /* command line options */
 static int		cuda_dindex = -1;
@@ -53,7 +51,6 @@ static long				PAGE_SIZE;
 static CUdevice			cuda_device;
 static CUcontext		cuda_context;
 static unsigned long	curr_fpos = 0;	/* to be updated by atomic add */
-static int				license_validation = -1;
 static int				filedesc = -1;	/* buffered i/o */
 static const char	   *filename = NULL;
 static GPUDirectFileDesc gds_fdesc;
@@ -82,60 +79,6 @@ cuErrorName(CUresult code)
 	return error_name;
 }
 
-#define elog(fmt,...)									\
-	do {												\
-		fprintf(stderr, "ssd2gpu_test(%d): " fmt "\n",	\
-				__LINE__, ##__VA_ARGS__);				\
-		exit(1);										\
-	} while(0)
-
-/*
- * heterodbExtraModuleInit
- */
-static char *(*p_heterodb_extra_module_init)(void) = NULL;
-
-static char *
-heterodbExtraModuleInit(void)
-{
-	char   *res;
-
-	if (!p_heterodb_extra_module_init)
-		res = strdup("");
-	else
-		res = p_heterodb_extra_module_init();
-
-	if (!res)
-		elog("out of memory");
-	return res;
-}
-
-/*
- * heterodbExtraEreport
- */
-static heterodb_extra_error_info   *p_heterodb_extra_error_data = NULL;
-static void
-heterodbExtraEreport(int status)
-{
-	fprintf(stderr, "ssd2gpu_test (%s:%d) - %s\n",
-			p_heterodb_extra_error_data->filename,
-			p_heterodb_extra_error_data->lineno,
-			p_heterodb_extra_error_data->message);
-	exit(status);
-}
-
-/*
- * heterodbLicenseReload
- */
-static int  (*p_heterodb_license_reload)(void) = NULL;
-
-static void
-heterodbLicenseReload(void)
-{
-	license_validation = p_heterodb_license_reload();
-	if (license_validation < 0)
-		heterodbExtraEreport(1);
-}
-
 /*
  * gpuDirectInitDriver
  */
@@ -146,7 +89,7 @@ gpuDirectInitDriver(void)
 {
 	if (p_gpudirect_init_driver &&
 		p_gpudirect_init_driver() != 0)
-		heterodbExtraEreport(1);
+		__Elog("failed on gpuDirectInitDriver");
 }
 
 /*
@@ -159,7 +102,7 @@ gpuDirectCloseDriver(void)
 {
 	if (p_gpudirect_close_driver &&
 		p_gpudirect_close_driver() != 0)
-		heterodbExtraEreport(1);
+		__Elog("failed on gpuDirectCloseDriver");
 }
 
 /*
@@ -178,7 +121,7 @@ gpuDirectFileDescOpen(GPUDirectFileDesc *gds_fdesc,
 	if (p_gpudirect_file_desc_open)
 	{
 		if (p_gpudirect_file_desc_open(gds_fdesc, rawfd, pathname))
-			heterodbExtraEreport(1);
+			__Elog("failed on gpuDirectFileDescOpen");
 	}
 	else
 	{
@@ -186,7 +129,7 @@ gpuDirectFileDescOpen(GPUDirectFileDesc *gds_fdesc,
 		struct stat st_buf;
 
 		if (fstat(rawfd, &st_buf) != 0)
-			elog("failed on fstat('%s'): %m", pathname);
+			__Elog("failed on fstat('%s'): %m", pathname);
 		gds_fdesc->rawfd = rawfd;
         gds_fdesc->bytesize = st_buf.st_size;
 	}
@@ -228,7 +171,7 @@ gpuDirectMapGpuMemory(CUdeviceptr m_segment,
 										m_segment_sz,
 										p_iomap_handle);
 		if (rc != CUDA_SUCCESS)
-			elog("failed on gpuDirectMapGpuMemory: %s",
+			__Elog("failed on gpuDirectMapGpuMemory: %s",
 				 cuErrorName(rc));
 	}
 }
@@ -251,7 +194,7 @@ gpuDirectUnmapGpuMemory(CUdeviceptr m_segment,
 		rc = p_gpudirect_unmap_gpu_memory(m_segment,
 										  iomap_handle);
 		if (rc != CUDA_SUCCESS)
-			elog("failed on gpuDirectUnmapGpuMemory: %s",
+			__Elog("failed on gpuDirectUnmapGpuMemory: %s",
 				 cuErrorName(rc));
 	}
 }
@@ -280,7 +223,7 @@ gpuDirectFileReadIOV(const GPUDirectFileDesc *gds_fdesc,
 									  iomap_handle,
 									  m_offset,
 									  iovec))
-			elog("failed on gpuDirectFileReadIOV: %m");
+			__Elog("failed on gpuDirectFileReadIOV: %m");
 	}
 	else
 	{
@@ -308,7 +251,7 @@ gpuDirectFileReadIOV(const GPUDirectFileDesc *gds_fdesc,
 			{
 				nbytes = pread(gds_fdesc->rawfd, host_pos, file_pos, remained);
 				if (nbytes <= 0)
-					elog("failed on pread(fpos=%lu, sz=%lu): %m",
+					__Elog("failed on pread(fpos=%lu, sz=%lu): %m",
 						 file_pos, remained);
 				host_pos += nbytes;
 				file_pos += nbytes;
@@ -317,7 +260,7 @@ gpuDirectFileReadIOV(const GPUDirectFileDesc *gds_fdesc,
 			/* RAM-to-GPU copy */
 			rc = cuMemcpyHtoD(m_segment + dest_pos, buffer, length);
 			if (rc != CUDA_SUCCESS)
-				elog("failed on cuMemcpyHtoD: %s", cuErrorName(rc));
+				__Elog("failed on cuMemcpyHtoD: %s", cuErrorName(rc));
 		}
 	}
 }
@@ -447,7 +390,7 @@ exec_gpudirect_test(void *private)
 
 	rc = cuCtxSetCurrent(cuda_context);
 	if (rc != CUDA_SUCCESS)
-		elog("failed on cuCtxSetCurrent: %s", cuErrorName(rc));
+		__Elog("failed on cuCtxSetCurrent: %s", cuErrorName(rc));
 
 	iovec = alloca(offsetof(strom_io_vector, ioc[1]));
 	for (;;)
@@ -483,7 +426,7 @@ exec_gpudirect_test(void *private)
 							  wcontext->dev_buffer + wcontext->dev_moffset + drift,
 							  nbytes);
 			if (rc != CUDA_SUCCESS)
-				elog("failed on cuMemcpyDtoH: %s", cuErrorName(rc));
+				__Elog("failed on cuMemcpyDtoH: %s", cuErrorName(rc));
 
 			/* read file via VFS */
 			sz = pread(filedesc,
@@ -491,9 +434,9 @@ exec_gpudirect_test(void *private)
 					   nbytes,
 					   f_pos);
 			if (sz < 0)
-				elog("failed on pread(%d, %p, %ld, %ld): %m", gds_fdesc.rawfd, wcontext->src_buffer, nbytes, f_pos);
+				__Elog("failed on pread(%d, %p, %ld, %ld): %m", gds_fdesc.rawfd, wcontext->src_buffer, nbytes, f_pos);
 			if (sz < nbytes)
-				elog("pread(2) read shorter than the required (%ld of %ld)",
+				__Elog("pread(2) read shorter than the required (%ld of %ld)",
 					 sz, nbytes);
 			if (memcmp(wcontext->dst_buffer,
 					   wcontext->src_buffer,
@@ -569,7 +512,7 @@ parse_options(int argc, char * const argv[])
 						usage(argv[0]);
 				}
 				if ((segment_sz & (PAGE_SIZE-1)) != 0)
-					elog("segment size must be multiple of PAGE_SIZE: %s", optarg);
+					__Elog("segment size must be multiple of PAGE_SIZE: %s", optarg);
 				break;
 			case 'c':
 				enable_checks = 1;
@@ -601,7 +544,7 @@ lookup_heterodb_extra_function(void *handle, const char *symbol)
 
 	fn_addr = dlsym(handle, symbol);
 	if (!fn_addr)
-		elog("could not find extra symbol \"%s\" - %s", symbol, dlerror());
+		__Elog("could not find extra symbol \"%s\" - %s", symbol, dlerror());
 	//printf("[%s] at %p\n", symbol, fn_addr);
 	return fn_addr;
 }
@@ -626,69 +569,24 @@ static void
 load_heterodb_extra(void)
 {
 	void	   *handle;
-	char	   *extra_module_info;
-	bool		has_cufile = false;
-	bool		has_nvme_strom = false;
-	char	   *tok, *pos;;
 
-	handle = dlopen(HETERODB_EXTRA_FILENAME,
+	handle = dlopen(HETERODB_EXTRA_PATHNAME,
 					RTLD_NOW | RTLD_LOCAL);
 	if (!handle)
-	{
-		handle = dlopen(HETERODB_EXTRA_PATHNAME,
-						RTLD_NOW | RTLD_LOCAL);
-		if (!handle)
-		{
-			if (!kernel_driver)
-				kernel_driver = "vfs";
-			else if (strcmp(kernel_driver, "vfs") != 0)
-				elog("kernel driver [%s] is not supported", kernel_driver);
-			return;
-		}
-	}
+		__Elog("unable to load [%s]: %m", HETERODB_EXTRA_PATHNAME);
 
-	LOOKUP_HETERODB_EXTRA_FUNCTION(heterodb_extra_error_data);
-	LOOKUP_HETERODB_EXTRA_FUNCTION(heterodb_extra_module_init);
-	LOOKUP_HETERODB_EXTRA_FUNCTION(heterodb_license_reload);
-	extra_module_info = heterodbExtraModuleInit();
-	for (tok = strtok_r(extra_module_info, ",", &pos);
-		 tok != NULL;
-		 tok = strtok_r(NULL, ",", &pos))
-	{
-		if (strncmp(tok, "cufile=", 7) == 0)
-		{
-			if (strcmp(tok+7, "on") == 0)
-				has_cufile = true;
-			else if (strcmp(tok+7, "off") == 0)
-				has_cufile = false;
-			else
-				elog("invalid extra module token [%s]", tok);
-		}
-		else if (strncmp(tok, "nvme_strom=", 11) == 0)
-		{
-			if (strcmp(tok+11, "on") == 0)
-				has_nvme_strom = true;
-			else if (strcmp(tok+11, "off") == 0)
-				has_nvme_strom = false;
-			else
-				elog("invalid extra module token [%s]", tok);
-		}
-		/* ignore unknown tokens */
-	}
+	//LOOKUP_HETERODB_EXTRA_FUNCTION(heterodb_extra_error_data);
+	//LOOKUP_HETERODB_EXTRA_FUNCTION(heterodb_extra_module_init);
+	//LOOKUP_HETERODB_EXTRA_FUNCTION(heterodb_license_reload);
 
 	if (!kernel_driver)
 	{
-		if (has_cufile)
+		if (access("/proc/driver/nvidia-fs/version", F_OK) == 0)
 			kernel_driver = "cufile";
-		else if (has_nvme_strom)
+		else if (access("/proc/nvme-strom", F_OK) == 0)
 			kernel_driver = "nvme_strom";
 		else
 			kernel_driver = "vfs";
-	}
-	else if ((strcmp(kernel_driver, "cufile") == 0 && !has_cufile) ||
-			 (strcmp(kernel_driver, "nvme_strom") == 0 && !has_nvme_strom))
-	{
-		elog("kernel driver [%s] is not supported", kernel_driver);
 	}
 
 	if (strcmp(kernel_driver, "cufile") == 0 ||
@@ -703,7 +601,7 @@ load_heterodb_extra(void)
 		LOOKUP_GPUDIRECT_EXTRA_FUNCTION(kernel_driver,file_read_iov);
 	}
 	/* license reload */
-	heterodbLicenseReload();
+	//heterodbLicenseReload();
 }
 
 /*
@@ -729,23 +627,23 @@ setup_cuda_context(char *namebuf, size_t namebuf_sz)
 
 	rc = cuInit(0);
 	if (rc != CUDA_SUCCESS)
-		elog("failed on cuInit: %s", cuErrorName(rc));
+		__Elog("failed on cuInit: %s", cuErrorName(rc));
 
 	rv = nvmlInit();
 	if (rv != NVML_SUCCESS)
-		elog("failed on nvmlInit: %s", nvmlErrorString(rv));
+		__Elog("failed on nvmlInit: %s", nvmlErrorString(rv));
 
 	rc = cuDeviceGetCount(&count);
 	if (rc != CUDA_SUCCESS)
-		elog("failed on cuDeviceGetCount: %s", cuErrorName(rc));
+		__Elog("failed on cuDeviceGetCount: %s", cuErrorName(rc));
 	rv = nvmlDeviceGetCount(&__count);
 	if (rv != NVML_SUCCESS)
-		elog("failed on nvmlDeviceGetCount: %s", nvmlErrorString(rv));
+		__Elog("failed on nvmlDeviceGetCount: %s", nvmlErrorString(rv));
 	if (count != __count)
-		elog("CUDA and NVML returned inconsistent number of devices (%d,%d)",
+		__Elog("CUDA and NVML returned inconsistent number of devices (%d,%d)",
 			 count, __count);
 	if (count == 0)
-		elog("No GPU devices are available");
+		__Elog("No GPU devices are available");
 
 	/* check GPU brand and BAR1 memory size */
 	if (cuda_dindex < 0)
@@ -756,7 +654,7 @@ setup_cuda_context(char *namebuf, size_t namebuf_sz)
 	else
 	{
 		if (cuda_dindex >= count)
-			elog("'-d %d' is out of range", cuda_dindex);
+			__Elog("'-d %d' is out of range", cuda_dindex);
 		start = cuda_dindex;
 		end = cuda_dindex + 1;
 	}
@@ -769,15 +667,15 @@ setup_cuda_context(char *namebuf, size_t namebuf_sz)
 
 		rv = nvmlDeviceGetHandleByIndex(i, &nvml_device);
 		if (rv != NVML_SUCCESS)
-			elog("failed on nvmlDeviceGetHandleByIndex: %s",
+			__Elog("failed on nvmlDeviceGetHandleByIndex: %s",
 				 nvmlErrorString(rv));
 		rv = nvmlDeviceGetBrand(nvml_device, &nvml_brand);
 		if (rv != NVML_SUCCESS)
-			elog("failed on nvmlDeviceGetBrand: %s",
+			__Elog("failed on nvmlDeviceGetBrand: %s",
 				 nvmlErrorString(rv));
 		rv = nvmlDeviceGetBAR1MemoryInfo(nvml_device, &nvml_bar1);
 		if (rv != NVML_SUCCESS)
-			elog("failed on nvmlDeviceGetBAR1MemoryInfo: %s",
+			__Elog("failed on nvmlDeviceGetBAR1MemoryInfo: %s",
 				 nvmlErrorString(rv));
 		if ((nvml_brand == NVML_BRAND_QUADRO ||
 			 nvml_brand == NVML_BRAND_TESLA ||
@@ -792,26 +690,26 @@ setup_cuda_context(char *namebuf, size_t namebuf_sz)
 	if (__dindex < 0)
 	{
 		if (cuda_dindex < 0)
-			elog("No Tesla or Quadro GPUs are installed");
+			__Elog("No Tesla or Quadro GPUs are installed");
 		else
-			elog("GPU-%d is neither Tesla nor Quadro", cuda_dindex);
+			__Elog("GPU-%d is neither Tesla nor Quadro", cuda_dindex);
 	}
 	cuda_dindex = __dindex;
 
 	/* setup CUDA context */
 	rc = cuDeviceGet(&cuda_device, cuda_dindex);
 	if (rc != CUDA_SUCCESS)
-		elog("failed on cuDeviceGet: %s", cuErrorName(rc));
+		__Elog("failed on cuDeviceGet: %s", cuErrorName(rc));
 
 	rc = cuDeviceGetName(temp, sizeof(temp), cuda_device);
 	if (rc != CUDA_SUCCESS)
-		elog("failed on cuDeviceGetName: %s", cuErrorName(rc));
+		__Elog("failed on cuDeviceGetName: %s", cuErrorName(rc));
 
 	for (i=0; i < 5; i++)
 	{
 		rc = cuDeviceGetAttribute(&values[i], attrs[i], cuda_device);
 		if (rc != CUDA_SUCCESS)
-			elog("failed on cuDeviceGetAttribute: %s", cuErrorName(rc));
+			__Elog("failed on cuDeviceGetAttribute: %s", cuErrorName(rc));
 	}
 	snprintf(namebuf, namebuf_sz,
 			 "GPU%d %s (%04x:%02x:%02x.%d)",
@@ -823,7 +721,7 @@ setup_cuda_context(char *namebuf, size_t namebuf_sz)
 
 	rc = cuCtxCreate(&cuda_context, CU_CTX_SCHED_AUTO, cuda_dindex);
 	if (rc != CUDA_SUCCESS)
-		elog("failed on cuCtxCreate: %s", cuErrorName(rc));
+		__Elog("failed on cuCtxCreate: %s", cuErrorName(rc));
 }
 
 /*
@@ -850,7 +748,7 @@ int main(int argc, char * const argv[])
 	filename = parse_options(argc, argv);
 	filedesc = open(filename, O_RDONLY);
 	if (filedesc < 0)
-		elog("failed on open('%s'): %m", filename);
+		__Elog("failed on open('%s'): %m", filename);
 	load_heterodb_extra();
 
 	/* open source file */
@@ -880,17 +778,17 @@ int main(int argc, char * const argv[])
 
 	rc = cuMemAlloc(&dev_buffer, buffer_sz);
 	if (rc != CUDA_SUCCESS)
-		elog("failed on cuMemAlloc: %s", cuErrorName(rc));
+		__Elog("failed on cuMemAlloc: %s", cuErrorName(rc));
 
 	rc = cuMemHostAlloc(&src_buffer, buffer_sz,
 						CU_MEMHOSTALLOC_PORTABLE);
 	if (rc != CUDA_SUCCESS)
-		elog("failed on cuMemHostAlloc: %s", cuErrorName(rc));
+		__Elog("failed on cuMemHostAlloc: %s", cuErrorName(rc));
 
 	rc = cuMemHostAlloc(&dst_buffer, buffer_sz,
 						CU_MEMHOSTALLOC_PORTABLE);
 	if (rc != CUDA_SUCCESS)
-		elog("failed on cuMemHostAlloc: %s", cuErrorName(rc));
+		__Elog("failed on cuMemHostAlloc: %s", cuErrorName(rc));
 
 	gpuDirectMapGpuMemory(dev_buffer, buffer_sz, &dev_mhandle);
 
@@ -913,7 +811,7 @@ int main(int argc, char * const argv[])
 							   exec_gpudirect_test,
 							   wcontext[i]);
 		if (errno != 0)
-			elog("failed on pthread_create: %m");
+			__Elog("failed on pthread_create: %m");
 	}
 
 	/* wait for threads completion */
@@ -929,8 +827,7 @@ int main(int argc, char * const argv[])
 
 	gpuDirectUnmapGpuMemory(dev_buffer, dev_mhandle);
 	gpuDirectFileDescClose(&gds_fdesc);
-	gpuDirectCloseDriver();
-	cuCtxDestroy(cuda_context);
+//	gpuDirectCloseDriver();
 
 	show_throughput(filename, gds_fdesc.bytesize,
 					tv1, tv2,

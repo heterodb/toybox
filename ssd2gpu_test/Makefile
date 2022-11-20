@@ -1,10 +1,10 @@
 # HeteroDB Extra Package
 MODULE    = heterodb_extra.so
-OBJS      = license.o gpudirect.o sysfs.o misc.o
+OBJS      = gpudirect.o #misc.o #license.o #sysfs.o
 SSD2GPU   = ssd2gpu_test
 SSD2GPU_OBJ = $(SSD2GPU).o
 HEADERS   = heterodb_extra.h nvme_strom.h
-EXTRA_VERSION ?= $(shell cat ../VERSION)
+EXTRA_VERSION ?= 3.3
 
 CUDA_PATH_LIST := /usr/local/cuda /usr/local/cuda-*
 CUDA_PATH   := $(shell for x in $(CUDA_PATH_LIST);	\
@@ -17,9 +17,6 @@ CFLAGS    := -Wall -g -O2 -fPIC -D_GNU_SOURCE -I. \
              -I $(CUDA_PATH)/include \
              -L $(CUDA_PATH)/lib64   \
              -DHETERODB_EXTRA_VERSION="$(EXTRA_VERSION)"
-ifneq ($(EXTRA_RELEASE),)
-CFLAGS    += -DHETERODB_EXTRA_RELEASE="$(EXTRA_RELEASE)"
-endif
 LDFLAGS   := $(CFLAGS) -shared -lgmp -lcurl -lcufile \
              -Wl,-rpath,'$(CUDA_PATH)/lib64'
 

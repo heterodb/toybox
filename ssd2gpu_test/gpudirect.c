@@ -45,280 +45,14 @@ static size_t	PAGE_SIZE;
 static const char *
 __cuFileErrorText(CUfileError_t rv)
 {
-#define __ENT(x)	case x: return #x
-	switch (rv.cu_err)
-	{
-		case CUDA_SUCCESS:
-			return cufileop_status_error(rv.err);
-		__ENT(CUDA_ERROR_INVALID_VALUE);
-		__ENT(CUDA_ERROR_OUT_OF_MEMORY);
-		__ENT(CUDA_ERROR_NOT_INITIALIZED);
-		__ENT(CUDA_ERROR_DEINITIALIZED);
-		__ENT(CUDA_ERROR_PROFILER_DISABLED);
-		__ENT(CUDA_ERROR_PROFILER_NOT_INITIALIZED);
-		__ENT(CUDA_ERROR_PROFILER_ALREADY_STARTED);
-		__ENT(CUDA_ERROR_PROFILER_ALREADY_STOPPED);
-		__ENT(CUDA_ERROR_STUB_LIBRARY);
-		__ENT(CUDA_ERROR_NO_DEVICE);
-		__ENT(CUDA_ERROR_INVALID_DEVICE);
-		__ENT(CUDA_ERROR_DEVICE_NOT_LICENSED);
-		__ENT(CUDA_ERROR_INVALID_IMAGE);
-		__ENT(CUDA_ERROR_INVALID_CONTEXT);
-		__ENT(CUDA_ERROR_CONTEXT_ALREADY_CURRENT);
-		__ENT(CUDA_ERROR_MAP_FAILED);
-		__ENT(CUDA_ERROR_UNMAP_FAILED);
-		__ENT(CUDA_ERROR_ARRAY_IS_MAPPED);
-		__ENT(CUDA_ERROR_ALREADY_MAPPED);
-		__ENT(CUDA_ERROR_NO_BINARY_FOR_GPU);
-		__ENT(CUDA_ERROR_ALREADY_ACQUIRED);
-		__ENT(CUDA_ERROR_NOT_MAPPED);
-		__ENT(CUDA_ERROR_NOT_MAPPED_AS_ARRAY);
-		__ENT(CUDA_ERROR_NOT_MAPPED_AS_POINTER);
-		__ENT(CUDA_ERROR_ECC_UNCORRECTABLE);
-		__ENT(CUDA_ERROR_UNSUPPORTED_LIMIT);
-		__ENT(CUDA_ERROR_CONTEXT_ALREADY_IN_USE);
-		__ENT(CUDA_ERROR_PEER_ACCESS_UNSUPPORTED);
-		__ENT(CUDA_ERROR_INVALID_PTX);
-		__ENT(CUDA_ERROR_INVALID_GRAPHICS_CONTEXT);
-		__ENT(CUDA_ERROR_NVLINK_UNCORRECTABLE);
-		__ENT(CUDA_ERROR_JIT_COMPILER_NOT_FOUND);
-		__ENT(CUDA_ERROR_UNSUPPORTED_PTX_VERSION);
-		__ENT(CUDA_ERROR_JIT_COMPILATION_DISABLED);
-		__ENT(CUDA_ERROR_INVALID_SOURCE);
-		__ENT(CUDA_ERROR_FILE_NOT_FOUND);
-		__ENT(CUDA_ERROR_SHARED_OBJECT_SYMBOL_NOT_FOUND);
-		__ENT(CUDA_ERROR_SHARED_OBJECT_INIT_FAILED);
-		__ENT(CUDA_ERROR_OPERATING_SYSTEM);
-		__ENT(CUDA_ERROR_INVALID_HANDLE);
-		__ENT(CUDA_ERROR_ILLEGAL_STATE);
-		__ENT(CUDA_ERROR_NOT_FOUND);
-		__ENT(CUDA_ERROR_NOT_READY);
-		__ENT(CUDA_ERROR_ILLEGAL_ADDRESS);
-		__ENT(CUDA_ERROR_LAUNCH_OUT_OF_RESOURCES);
-		__ENT(CUDA_ERROR_LAUNCH_TIMEOUT);
-		__ENT(CUDA_ERROR_LAUNCH_INCOMPATIBLE_TEXTURING);
-		__ENT(CUDA_ERROR_PEER_ACCESS_ALREADY_ENABLED);
-		__ENT(CUDA_ERROR_PEER_ACCESS_NOT_ENABLED);
-		__ENT(CUDA_ERROR_PRIMARY_CONTEXT_ACTIVE);
-		__ENT(CUDA_ERROR_CONTEXT_IS_DESTROYED);
-		__ENT(CUDA_ERROR_ASSERT);
-		__ENT(CUDA_ERROR_TOO_MANY_PEERS);
-		__ENT(CUDA_ERROR_HOST_MEMORY_ALREADY_REGISTERED);
-		__ENT(CUDA_ERROR_HOST_MEMORY_NOT_REGISTERED);
-		__ENT(CUDA_ERROR_HARDWARE_STACK_ERROR);
-		__ENT(CUDA_ERROR_ILLEGAL_INSTRUCTION);
-		__ENT(CUDA_ERROR_MISALIGNED_ADDRESS);
-		__ENT(CUDA_ERROR_INVALID_ADDRESS_SPACE);
-		__ENT(CUDA_ERROR_INVALID_PC);
-		__ENT(CUDA_ERROR_LAUNCH_FAILED);
-		__ENT(CUDA_ERROR_COOPERATIVE_LAUNCH_TOO_LARGE);
-		__ENT(CUDA_ERROR_NOT_PERMITTED);
-		__ENT(CUDA_ERROR_NOT_SUPPORTED);
-		__ENT(CUDA_ERROR_SYSTEM_NOT_READY);
-		__ENT(CUDA_ERROR_SYSTEM_DRIVER_MISMATCH);
-		__ENT(CUDA_ERROR_COMPAT_NOT_SUPPORTED_ON_DEVICE);
-		__ENT(CUDA_ERROR_STREAM_CAPTURE_UNSUPPORTED);
-		__ENT(CUDA_ERROR_STREAM_CAPTURE_INVALIDATED);
-		__ENT(CUDA_ERROR_STREAM_CAPTURE_MERGE);
-		__ENT(CUDA_ERROR_STREAM_CAPTURE_UNMATCHED);
-		__ENT(CUDA_ERROR_STREAM_CAPTURE_UNJOINED);
-		__ENT(CUDA_ERROR_STREAM_CAPTURE_ISOLATION);
-		__ENT(CUDA_ERROR_STREAM_CAPTURE_IMPLICIT);
-		__ENT(CUDA_ERROR_CAPTURED_EVENT);
-		__ENT(CUDA_ERROR_STREAM_CAPTURE_WRONG_THREAD);
-		__ENT(CUDA_ERROR_TIMEOUT);
-		__ENT(CUDA_ERROR_GRAPH_EXEC_UPDATE_FAILURE);
-		default:
-			return "CUDA_ERROR_UNKNOWN";
-	}
-#undef __ENT
+	const char *str;
+
+	if (rv.cu_err != CUDA_SUCCESS)
+		cuGetErrorName(rv.cu_err, &str);
+	else
+		str = cufileop_status_error(rv.err);
+	return str;
 }
-
-#if 0
-/* cuFileDriverOpen */
-static CUfileError_t (*p_cuFileDriverOpen)(void) = NULL;
-
-CUfileError_t
-cuFileDriverOpen(void)
-{
-	if (!p_cuFileDriverOpen)
-		return CUFILE_ERROR__DRIVER_NOT_INITIALIZED;
-	return p_cuFileDriverOpen();
-}
-
-/* cuFileDriverClose */
-static CUfileError_t (*p_cuFileDriverClose)(void) = NULL;
-
-CUfileError_t
-cuFileDriverClose(void)
-{
-	if (!p_cuFileDriverClose)
-		return CUFILE_ERROR__DRIVER_NOT_INITIALIZED;
-	return p_cuFileDriverClose();
-}
-
-/* cuFileDriverGetProperties */
-static CUfileError_t (*p_cuFileDriverGetProperties)(
-	CUfileDrvProps_t *props) = NULL;
-
-CUfileError_t
-cuFileDriverGetProperties(CUfileDrvProps_t *props)
-{
-	if (!p_cuFileDriverGetProperties)
-		return CUFILE_ERROR__DRIVER_NOT_INITIALIZED;
-	return p_cuFileDriverGetProperties(props);
-}
-
-/* cuFileDriverSetPollMode */
-static CUfileError_t (*p_cuFileDriverSetPollMode)(
-	bool poll,
-	size_t poll_threshold_size) = NULL;
-
-CUfileError_t
-cuFileDriverSetPollMode(bool poll, size_t poll_threshold_size)
-{
-	if (!p_cuFileDriverSetPollMode)
-		return CUFILE_ERROR__DRIVER_NOT_INITIALIZED;
-	return p_cuFileDriverSetPollMode(poll, poll_threshold_size);
-}
-
-/* cuFileDriverSetMaxDirectIOSize */
-static CUfileError_t (*p_cuFileDriverSetMaxDirectIOSize)(
-	size_t max_direct_io_size) = NULL;
-
-CUfileError_t
-cuFileDriverSetMaxDirectIOSize(size_t max_direct_io_size)
-{
-	if (!p_cuFileDriverSetMaxDirectIOSize)
-		return CUFILE_ERROR__DRIVER_NOT_INITIALIZED;
-	return p_cuFileDriverSetMaxDirectIOSize(max_direct_io_size);
-}
-
-/* cuFileDriverSetMaxCacheSize */
-static CUfileError_t (*p_cuFileDriverSetMaxCacheSize)(
-	size_t max_cache_size) = NULL;
-
-CUfileError_t
-cuFileDriverSetMaxCacheSize(size_t max_cache_size)
-{
-	if (!p_cuFileDriverSetMaxCacheSize)
-		return CUFILE_ERROR__DRIVER_NOT_INITIALIZED;
-	return p_cuFileDriverSetMaxCacheSize(max_cache_size);
-}
-
-/* cuFileDriverSetMaxPinnedMemSize */
-static CUfileError_t (*p_cuFileDriverSetMaxPinnedMemSize)(
-	size_t max_pinned_size) = NULL;
-
-CUfileError_t
-cuFileDriverSetMaxPinnedMemSize(size_t max_pinned_size)
-{
-	if (!p_cuFileDriverSetMaxPinnedMemSize)
-		return CUFILE_ERROR__DRIVER_NOT_INITIALIZED;
-	return p_cuFileDriverSetMaxPinnedMemSize(max_pinned_size);
-}
-
-/* cuFileHandleRegister */
-static CUfileError_t (*p_cuFileHandleRegister)(
-	CUfileHandle_t *fh,
-	CUfileDescr_t *descr) = NULL;
-
-CUfileError_t
-cuFileHandleRegister(CUfileHandle_t *fh, CUfileDescr_t *descr)
-{
-	if (!p_cuFileHandleRegister)
-		return CUFILE_ERROR__DRIVER_NOT_INITIALIZED;
-	return p_cuFileHandleRegister(fh, descr);
-}
-
-/* cuFileHandleDeregister */
-static void (*p_cuFileHandleDeregister)(
-	CUfileHandle_t fh) = NULL;
-
-void
-cuFileHandleDeregister(CUfileHandle_t fh)
-{
-	if (p_cuFileHandleDeregister)
-		return p_cuFileHandleDeregister(fh);
-}
-
-/* cuFileBufRegister */
-static CUfileError_t (*p_cuFileBufRegister)(
-	const void *devPtr_base,
-	size_t length,
-	int flags) = NULL;
-
-CUfileError_t
-cuFileBufRegister(const void *devPtr_base, size_t length, int flags)
-{
-	if (!p_cuFileBufRegister)
-		return CUFILE_ERROR__DRIVER_NOT_INITIALIZED;
-	return p_cuFileBufRegister(devPtr_base, length, flags);
-}
-
-/* cuFileBufDeregister */
-static CUfileError_t (*p_cuFileBufDeregister)(
-	const void *devPtr_base) = NULL;
-
-CUfileError_t cuFileBufDeregister(const void *devPtr_base)
-{
-	if (!p_cuFileBufDeregister)
-		return CUFILE_ERROR__DRIVER_NOT_INITIALIZED;
-	return p_cuFileBufDeregister(devPtr_base);
-}
-
-/* cuFileRead */
-static ssize_t (*p_cuFileRead)(
-	CUfileHandle_t fh,
-	void *devPtr_base,
-	size_t size,
-	off_t file_offset,
-	off_t devPtr_offset) = NULL;
-
-ssize_t
-cuFileRead(CUfileHandle_t fh,
-		   void *devPtr_base,
-		   size_t size,
-		   off_t file_offset,
-		   off_t devPtr_offset)
-{
-	if (!p_cuFileRead)
-		return -CU_FILE_DRIVER_NOT_INITIALIZED;
-	return p_cuFileRead(fh, devPtr_base, size, file_offset, devPtr_offset);
-}
-
-/* cuFileWrite */
-static ssize_t (*p_cuFileWrite)(
-	CUfileHandle_t fh,
-	const void *devPtr_base,
-	size_t size,
-	off_t file_offset,
-	off_t devPtr_offset) = NULL;
-
-ssize_t cuFileWrite(CUfileHandle_t fh,
-					const void *devPtr_base,
-					size_t size,
-					off_t file_offset,
-					off_t devPtr_offset)
-{
-	if (!p_cuFileWrite)
-		return -CU_FILE_DRIVER_NOT_INITIALIZED;
-	return p_cuFileWrite(fh,devPtr_base,size,file_offset,devPtr_offset);
-}
-
-/* lookup_cufile_function */
-static void *
-lookup_cufile_function(void *handle, const char *func_name)
-{
-	void   *func_addr = dlsym(handle, func_name);
-
-	if (!func_addr)
-		Elog("could not find cuFile symbol \"%s\" - %s", func_name, dlerror());
-	return func_addr;
-}
-#define LOOKUP_CUFILE_FUNCTION(func_name)		\
-	(p_##func_name = lookup_cufile_function(handle, #func_name)) != NULL
-#endif
 
 /* ------------------------------------------------------------
  *
@@ -360,12 +94,12 @@ cufile__file_desc_open_by_path(GPUDirectFileDesc *gds_fdesc,
 	rawfd = open(pathname, O_RDONLY | O_DIRECT);
 	if (rawfd < 0)
 	{
-		Elog("failed on open('%s'): %m", pathname);
+		__Elog("failed on open('%s'): %m", pathname);
 		return -1;
 	}
 	if (fstat(rawfd, &st_buf) != 0)
 	{
-		Elog("failed on fstat('%s'): %m", pathname);
+		__Elog("failed on fstat('%s'): %m", pathname);
 		close(rawfd);
 		return -1;
 	}
@@ -376,7 +110,7 @@ cufile__file_desc_open_by_path(GPUDirectFileDesc *gds_fdesc,
 	if (rv.cu_err != CUDA_SUCCESS || rv.err != CU_FILE_SUCCESS)
 	{
 		close(rawfd);
-		Elog("failed on cuFileHandleRegister('%s'): %s",
+		__Elog("failed on cuFileHandleRegister('%s'): %s",
 			 pathname, __cuFileErrorText(rv));
 		return -1;
 	}
@@ -396,11 +130,11 @@ __nvme_strom__file_desc_open_common(GPUDirectFileDesc *gds_fdesc,
 
 	if (fstat(rawfd, &st_buf) != 0)
 	{
-		Elog("failed on fstat('%s'): %m", pathname);
+		__Elog("failed on fstat('%s'): %m", pathname);
 	}
 	else if (!S_ISREG(st_buf.st_mode))
 	{
-		Elog("'%s' is not a regular file", pathname);
+		__Elog("'%s' is not a regular file", pathname);
 	}
 	else
 	{
@@ -413,7 +147,7 @@ __nvme_strom__file_desc_open_common(GPUDirectFileDesc *gds_fdesc,
 			gds_fdesc->bytesize = st_buf.st_size;
 			return 0;
 		}
-		Elog("nvme_strom does not support '%s'", pathname);
+		__Elog("nvme_strom does not support '%s'", pathname);
 	}
 	close(rawfd);
 	return -1;
@@ -428,7 +162,7 @@ nvme_strom__file_desc_open_by_path(GPUDirectFileDesc *gds_fdesc,
 	rawfd = open(pathname, O_RDONLY, 0600);
 	if (rawfd < 0)
 	{
-		Elog("failed on open('%s'): %m", pathname);
+		__Elog("failed on open('%s'): %m", pathname);
 		return -1;
 	}
 	return __nvme_strom__file_desc_open_common(gds_fdesc, rawfd, pathname);
@@ -460,7 +194,7 @@ nvme_strom__file_desc_open(GPUDirectFileDesc *gds_fdesc,
 	rawfd = dup(rawfd);
 	if (rawfd < 0)
 	{
-		Elog("failed on dup(2): %m");
+		__Elog("failed on dup(2): %m");
 		return -1;
 	}
 	return __nvme_strom__file_desc_open_common(gds_fdesc, rawfd, pathname);
@@ -474,14 +208,14 @@ cufile__file_desc_close(const GPUDirectFileDesc *gds_fdesc)
 {
 	cuFileHandleDeregister(gds_fdesc->fhandle);
 	if (close(gds_fdesc->rawfd))
-		Elog("failed on close(2): %m\n");
+		__Elog("failed on close(2): %m\n");
 }
 
 void
 nvme_strom__file_desc_close(const GPUDirectFileDesc *gds_fdesc)
 {
 	if (close(gds_fdesc->rawfd))
-		Elog("failed on close(2): %m\n");
+		__Elog("failed on close(2): %m\n");
 }
 
 /*
@@ -582,7 +316,7 @@ cufile__file_read_iov(const GPUDirectFileDesc *gds_fdesc,
 								dest_pos);
 			if (nbytes != sz)
 			{
-				Elog("failed on cuFileRead: nbytes=%zd of len=%zd, at %lu",
+				__Elog("failed on cuFileRead: nbytes=%zd of len=%zd, at %lu",
 					 nbytes, sz, file_pos);
 				return -1;
 			}
@@ -615,7 +349,7 @@ nvme_strom__file_read_iov(const GPUDirectFileDesc *gds_fdesc,
 
 	if (nvme_strom_ioctl(STROM_IOCTL__MEMCPY_SSD2GPU_RAW, &cmd) != 0)
 	{
-		Elog("failed on STROM_IOCTL__MEMCPY_SSD2GPU_RAW: %m\n");
+		__Elog("failed on STROM_IOCTL__MEMCPY_SSD2GPU_RAW: %m\n");
 		return -1;
 	}
 
@@ -626,7 +360,7 @@ nvme_strom__file_read_iov(const GPUDirectFileDesc *gds_fdesc,
 	{
 		if (errno != EINTR)
 		{
-			Elog("failed on STROM_IOCTL__MEMCPY_WAIT): %m\n");
+			__Elog("failed on STROM_IOCTL__MEMCPY_WAIT): %m\n");
 			return -1;
 		}
 	}
@@ -641,75 +375,12 @@ cufile__init_driver(void)
 {
 	/* system properties */
 	PAGE_SIZE = sysconf(_SC_PAGESIZE);
-
 	/* check nvidia-fs */
 	if (access("/proc/driver/nvidia-fs/version", F_OK) != 0)
 	{
-		Elog("it looks nvidia-fs kernel module is not loaded");
+		__Elog("it looks nvidia-fs kernel module is not loaded");
 		return 1;
 	}
-#if 0
-	handle = dlopen("libcufile.so", RTLD_NOW | RTLD_LOCAL);
-	if (!handle)
-	{
-		handle = dlopen("/usr/local/cuda/lib64/libcufile.so",
-						RTLD_NOW | RTLD_LOCAL);
-		if (!handle)
-		{
-			Elog("failed on dlopen('libcufile.so'): %m");
-			return 1;
-		}
-	}
-
-	if (LOOKUP_CUFILE_FUNCTION(cuFileDriverOpen) &&
-		LOOKUP_CUFILE_FUNCTION(cuFileDriverClose) &&
-		LOOKUP_CUFILE_FUNCTION(cuFileDriverGetProperties) &&
-		LOOKUP_CUFILE_FUNCTION(cuFileDriverSetPollMode) &&
-		LOOKUP_CUFILE_FUNCTION(cuFileDriverSetMaxDirectIOSize) &&
-		LOOKUP_CUFILE_FUNCTION(cuFileDriverSetMaxCacheSize) &&
-		LOOKUP_CUFILE_FUNCTION(cuFileDriverSetMaxPinnedMemSize) &&
-		LOOKUP_CUFILE_FUNCTION(cuFileHandleRegister) &&
-		LOOKUP_CUFILE_FUNCTION(cuFileHandleDeregister) &&
-		LOOKUP_CUFILE_FUNCTION(cuFileBufRegister) &&
-		LOOKUP_CUFILE_FUNCTION(cuFileBufDeregister) &&
-		LOOKUP_CUFILE_FUNCTION(cuFileRead) &&
-		LOOKUP_CUFILE_FUNCTION(cuFileWrite))
-	{
-		return 0;	/* Ok */
-	}
-	/* symbol not found - cleanup */
-	dlclose(handle);
-
-	p_cuFileDriverOpen = NULL;
-	p_cuFileDriverClose = NULL;
-	p_cuFileDriverGetProperties = NULL;
-	p_cuFileDriverSetPollMode = NULL;
-	p_cuFileDriverSetMaxDirectIOSize = NULL;
-	p_cuFileDriverSetMaxCacheSize = NULL;
-	p_cuFileDriverSetMaxPinnedMemSize = NULL;
-	p_cuFileHandleRegister = NULL;
-	p_cuFileHandleDeregister = NULL;
-	p_cuFileBufRegister = NULL;
-	p_cuFileBufDeregister = NULL;
-	p_cuFileRead = NULL;
-	p_cuFileWrite = NULL;
-
-	return 1;
-
-	p_cuFileDriverOpen = cuFileDriverOpen;
-	p_cuFileDriverClose = cuFileDriverClose;
-	p_cuFileDriverGetProperties = cuFileDriverGetProperties;
-	p_cuFileDriverSetPollMode = cuFileDriverSetPollMode;
-	p_cuFileDriverSetMaxDirectIOSize = cuFileDriverSetMaxDirectIOSize;
-	p_cuFileDriverSetMaxCacheSize = cuFileDriverSetMaxCacheSize;
-	p_cuFileDriverSetMaxPinnedMemSize = cuFileDriverSetMaxPinnedMemSize;
-	p_cuFileHandleRegister = cuFileHandleRegister;
-	p_cuFileHandleDeregister = cuFileHandleDeregister;
-	p_cuFileBufRegister = cuFileBufRegister;
-	p_cuFileBufDeregister = cuFileBufDeregister;
-	p_cuFileRead = cuFileRead;
-	p_cuFileWrite = cuFileWrite;
-#endif
 	return 0;
 }
 
@@ -718,32 +389,29 @@ nvme_strom__init_driver(void)
 {
 	/* system properties */
 	PAGE_SIZE = sysconf(_SC_PAGESIZE);
+	/* check nvme-strom */
+	if (access("/proc/nvme-strom", F_OK) != 0)
+	{
+		__Elog("it looks nvme-strom kernel module is not loaded");
+		return 1;
+	}
 	return 0;
 }
 
 /*
  * PREFIX__open_driver
  */
-static bool		cufile_driver_opened = false;
-
 int
 cufile__open_driver(void)
 {
 	CUfileError_t	rv;
 
-	if (cufile_driver_opened)
-	{
-		Elog("cuFileDriverOpen is called twice");
-		return -1;
-	}
-
 	rv = cuFileDriverOpen();
 	if (rv.err != CU_FILE_SUCCESS || rv.cu_err != CUDA_SUCCESS)
 	{
-		Elog("failed on cuFileDriverOpen: %s", __cuFileErrorText(rv));
+		__Elog("failed on cuFileDriverOpen: %s", __cuFileErrorText(rv));
 		return -1;
 	}
-	cufile_driver_opened = true;
 	return 0;
 }
 
@@ -765,19 +433,13 @@ nvme_strom__open_driver(void)
 int
 cufile__close_driver(void)
 {
-	fprintf(stderr, "cufile__close_driver is called\n");
-	if (cufile_driver_opened)
-	{
-		CUfileError_t	rv;
+	CUfileError_t	rv;
 
-		rv = cuFileDriverClose();
-		fprintf(stderr, "cuFileDriverClose = %d %d\n", rv.err, rv.cu_err);
-		if (rv.err != CU_FILE_SUCCESS || rv.cu_err != CUDA_SUCCESS)
-		{
-			Elog("failed on cuFileDriverClose: %s", __cuFileErrorText(rv));
-			return -1;
-		}
-		cufile_driver_opened = false;
+	rv = cuFileDriverClose();
+	if (rv.err != CU_FILE_SUCCESS || rv.cu_err != CUDA_SUCCESS)
+	{
+		__Elog("failed on cuFileDriverClose: %s", __cuFileErrorText(rv));
+		return -1;
 	}
 	return 0;
 }
